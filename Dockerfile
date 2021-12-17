@@ -76,18 +76,16 @@ EXPOSE 8030
 RUN apt-get update \
     && apt-get install -y libpq-dev ca-certificates netcat
 
-# ADD docker/wait_for docker/start /usr/local/bin/
-COPY docker/wait_for /usr/local/bin/
-COPY docker/start /usr/local/bin/
+ADD docker/wait_for docker/start /usr/local/bin/
 COPY --from=graph-node-build /usr/local/cargo/bin/graph-node /usr/local/cargo/bin/graphman /usr/local/bin/
 COPY --from=graph-node-build /etc/image-info /etc/image-info
 COPY docker/Dockerfile /Dockerfile
 CMD start
 
 # Debug image to access core dumps
-FROM graph-node-build as graph-node-debug
-RUN apt-get update \
-    && apt-get install -y curl gdb postgresql-client
+# FROM graph-node-build as graph-node-debug
+# RUN apt-get update \
+#     && apt-get install -y curl gdb postgresql-client
 
-COPY docker/Dockerfile /Dockerfile
-COPY docker/bin/* /usr/local/bin/
+# COPY docker/Dockerfile /Dockerfile
+# COPY docker/bin/* /usr/local/bin/
