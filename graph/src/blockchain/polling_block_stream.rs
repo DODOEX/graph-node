@@ -23,6 +23,13 @@ use fail::fail_point;
 // A high number here forces a slow start.
 const STARTING_PREVIOUS_TRIGGERS_PER_BLOCK: f64 = 1_000_000.0;
 
+lazy_static! {
+    static ref RANGE_MIN_SIZE: BlockNumber = std::env::var("GRAPH_RANGE_MIN_SIZE")
+        .unwrap_or("10".into())
+        .parse::<BlockNumber>()
+        .expect("invalid range min size");
+}
+
 enum BlockStreamState<C>
 where
     C: Blockchain,
@@ -371,12 +378,12 @@ where
             // - Scan 500 blocks:
             //   1000 triggers found, 2 per block, range_size = 1000 / 2 = 500
             let range_size_upper_limit =
-                max_block_range_size.min(ctx.previous_block_range_size.min(1) * 10000);
+                max_block_range_size.min(ctx.previous_block_range_size * *RANGE_MIN_SIZE);
             let range_size = if ctx.previous_triggers_per_block == 0.0 {
                 range_size_upper_limit
             } else {
                 (self.target_triggers_per_block_range as f64 / ctx.previous_triggers_per_block)
-                    .max(10000.0)
+                    .max(f64::from(*RANGE_MIN_SIZE))
                     .min(range_size_upper_limit as f64) as BlockNumber
             };
             let to = cmp::min(from + range_size - 1, to_limit);
