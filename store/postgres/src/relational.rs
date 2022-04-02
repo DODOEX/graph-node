@@ -9,24 +9,26 @@
 use diesel::{connection::SimpleConnection, Connection};
 use diesel::{debug_query, OptionalExtension, PgConnection, RunQueryDsl};
 use graph::cheap_clone::CheapClone;
-use graph::prelude::{q, s, StopwatchMetrics};
+use graph::constraint_violation;
+use graph::data::graphql::{DirectiveExt, TypeExt as _};
+use graph::prelude::{q, s, StopwatchMetrics, ENV_VARS};
 use graph::slog::warn;
 use inflector::Inflector;
 use lazy_static::lazy_static;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::{From, TryFrom};
-use std::env;
 use std::fmt::{self, Write};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::relational_queries::{FindChangesQuery, FindPossibleDeletionsQuery};
 use crate::{
     primary::{Namespace, Site},
     relational_queries::{
-        ClampRangeQuery, ConflictingEntityQuery, EntityData, FilterCollection, FilterQuery,
-        FindManyQuery, FindQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery,
+        ClampRangeQuery, ConflictingEntityQuery, EntityData, EntityDeletion, FilterCollection,
+        FilterQuery, FindManyQuery, FindQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery,
     },
 };
 use graph::components::store::EntityType;
@@ -36,11 +38,11 @@ use graph::data::store::BYTES_SCALAR;
 use graph::data::subgraph::schema::{POI_OBJECT, POI_TABLE};
 use graph::prelude::{
     anyhow, info, BlockNumber, DeploymentHash, Entity, EntityChange, EntityCollection,
-    EntityFilter, EntityKey, EntityOrder, EntityRange, Logger, QueryExecutionError, StoreError,
-    StoreEvent, ValueType, BLOCK_NUMBER_MAX,
+    EntityFilter, EntityKey, EntityOperation, EntityOrder, EntityRange, Logger,
+    QueryExecutionError, StoreError, StoreEvent, ValueType, BLOCK_NUMBER_MAX,
 };
 
-use crate::block_range::BLOCK_RANGE_COLUMN;
+use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
 pub use crate::catalog::Catalog;
 use crate::connection_pool::ForeignServer;
 use crate::{catalog, deployment};
@@ -55,40 +57,13 @@ const DELETE_OPERATION_CHUNK_SIZE: usize = 1_000;
 /// This also makes sure that we do not put strings into a BTree index that's
 /// bigger than Postgres' limit on such strings which is about 2k
 pub const STRING_PREFIX_SIZE: usize = 256;
+pub const BYTE_ARRAY_PREFIX_SIZE: usize = 64;
 
 lazy_static! {
-    /// Deprecated; use 'graphman stats account-like' instead. A list of
-    /// fully qualified table names that contain entities that are like
-    /// accounts in that they have a relatively small number of entities,
-    /// with a large number of change for each entity. It is useful to treat
-    /// such tables special in queries by changing the clause that selects
-    /// for a specific block range in a way that makes the BRIN index on
-    /// block_range usable
-    ///
-    /// Example: GRAPH_ACCOUNT_TABLES=sgd21902.pair,sgd1708.things
-    static ref ACCOUNT_TABLES: HashSet<String> = {
-            // Transform the entries in the form `schema.table` into
-            // `"schema"."table"` so that we can compare to a table's
-            // qualified name
-            env::var("GRAPH_ACCOUNT_TABLES")
-                .ok()
-                .map(|v| v.split(',').map(|s| format!("\"{}\"", s.replace(".", "\".\""))).collect())
-                .unwrap_or(HashSet::new())
-    };
-
-    /// `GRAPH_SQL_STATEMENT_TIMEOUT` is the timeout for queries in seconds.
-    /// If it is not set, no statement timeout will be enforced. The statement
-    /// timeout is local, i.e., can only be used within a transaction and
-    /// will be cleared at the end of the transaction
-    static ref STATEMENT_TIMEOUT: Option<String> = {
-        env::var("GRAPH_SQL_STATEMENT_TIMEOUT")
-        .ok()
-        .map(|s| {
-            u64::from_str(&s).unwrap_or_else(|_| {
-                panic!("GRAPH_SQL_STATEMENT_TIMEOUT must be a number, but is `{}`", s)
-            })
-        }).map(|timeout| format!("set local statement_timeout={}", timeout * 1000))
-    };
+    static ref STATEMENT_TIMEOUT: Option<String> = ENV_VARS
+        .graphql
+        .sql_statement_timeout
+        .map(|duration| format!("set local statement_timeout={}", duration.as_millis()));
 }
 
 /// A string we use as a SQL name for a table or column. The important thing
@@ -235,12 +210,7 @@ impl Layout {
     /// Generate a layout for a relational schema for entities in the
     /// GraphQL schema `schema`. The name of the database schema in which
     /// the subgraph's tables live is in `schema`.
-    pub fn new(
-        site: Arc<Site>,
-        schema: &Schema,
-        catalog: Catalog,
-        create_proof_of_indexing: bool,
-    ) -> Result<Self, StoreError> {
+    pub fn new(site: Arc<Site>, schema: &Schema, catalog: Catalog) -> Result<Self, StoreError> {
         // Extract enum types
         let enums: EnumMap = schema
             .document
@@ -276,7 +246,7 @@ impl Layout {
         let id_types_for_interface = schema.types_for_interface.iter().map(|(interface, types)| {
             types
                 .iter()
-                .map(|obj_type| IdType::try_from(obj_type))
+                .map(IdType::try_from)
                 .collect::<Result<HashSet<_>, _>>()
                 .and_then(move |types| {
                     if types.len() > 1 {
@@ -289,6 +259,7 @@ impl Layout {
                     } else {
                         // For interfaces that are not implemented at all, pretend
                         // they have a String `id` field
+                        // see also: id-type-for-unimplemented-interfaces
                         let id_type = types.iter().next().cloned().unwrap_or(IdType::String);
                         Ok((interface.to_owned(), id_type))
                     }
@@ -319,19 +290,26 @@ impl Layout {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if create_proof_of_indexing {
+        if catalog.use_poi {
             tables.push(Self::make_poi_table(&catalog, tables.len()))
         }
 
-        let tables: Vec<_> = tables.into_iter().map(|table| Arc::new(table)).collect();
+        let tables: Vec<_> = tables.into_iter().map(Arc::new).collect();
 
         let count_query = tables
             .iter()
             .map(|table| {
-                format!(
-                    "select count(*) from \"{}\".\"{}\" where block_range @> {}",
-                    &catalog.site.namespace, table.name, BLOCK_NUMBER_MAX
-                )
+                if table.immutable {
+                    format!(
+                        "select count(*) from \"{}\".\"{}\"",
+                        &catalog.site.namespace, table.name
+                    )
+                } else {
+                    format!(
+                        "select count(*) from \"{}\".\"{}\" where block_range @> {}",
+                        &catalog.site.namespace, table.name, BLOCK_NUMBER_MAX
+                    )
+                }
             })
             .collect::<Vec<_>>()
             .join("\nunion all\n");
@@ -369,6 +347,7 @@ impl Layout {
                     column_type: ColumnType::Bytes,
                     fulltext_fields: None,
                     is_reference: false,
+                    use_prefix_comparison: false,
                 },
                 Column {
                     name: SqlName::from(PRIMARY_KEY_COLUMN),
@@ -379,6 +358,7 @@ impl Layout {
                     column_type: ColumnType::String,
                     fulltext_fields: None,
                     is_reference: false,
+                    use_prefix_comparison: false,
                 },
             ],
             /// The position of this table in all the tables for this layout; this
@@ -386,6 +366,7 @@ impl Layout {
             /// predictable
             position: position as u32,
             is_account_like: false,
+            immutable: false,
         }
     }
 
@@ -398,8 +379,8 @@ impl Layout {
         site: Arc<Site>,
         schema: &Schema,
     ) -> Result<Layout, StoreError> {
-        let catalog = Catalog::new(conn, site.clone())?;
-        let layout = Self::new(site, schema, catalog, true)?;
+        let catalog = Catalog::for_creation(site.cheap_clone());
+        let layout = Self::new(site, schema, catalog)?;
         let sql = layout
             .as_ddl()
             .map_err(|_| StoreError::Unknown(anyhow!("failed to generate DDL for layout")))?;
@@ -531,7 +512,7 @@ impl Layout {
             .transpose()
     }
 
-    pub fn find_many<'a>(
+    pub fn find_many(
         &self,
         conn: &PgConnection,
         ids_for_type: &BTreeMap<&EntityType, Vec<&str>>,
@@ -559,6 +540,68 @@ impl Layout {
                 .push(data.deserialize_with_layout(self)?);
         }
         Ok(entities_for_type)
+    }
+
+    pub fn find_changes(
+        &self,
+        conn: &PgConnection,
+        block: BlockNumber,
+    ) -> Result<Vec<EntityOperation>, StoreError> {
+        let mut tables = Vec::new();
+        for table in self.tables.values() {
+            if table.name.as_str() != POI_TABLE {
+                tables.push(&**table);
+            }
+        }
+
+        let inserts_or_updates =
+            FindChangesQuery::new(&self.catalog.site.namespace, &tables[..], block)
+                .load::<EntityData>(conn)?;
+        let deletions =
+            FindPossibleDeletionsQuery::new(&self.catalog.site.namespace, &tables[..], block)
+                .load::<EntityDeletion>(conn)?;
+
+        let mut processed_entities = HashSet::new();
+        let mut changes = Vec::new();
+
+        for entity_data in inserts_or_updates.into_iter() {
+            let entity_type = entity_data.entity_type();
+            let mut data: Entity = entity_data.deserialize_with_layout(self)?;
+            let entity_id = data.id().expect("Invalid ID for entity.");
+            processed_entities.insert((entity_type.clone(), entity_id.clone()));
+
+            // `__typename` is not a real field.
+            data.remove("__typename")
+                .expect("__typename expected; this is a bug");
+
+            changes.push(EntityOperation::Set {
+                key: EntityKey {
+                    subgraph_id: self.site.deployment.cheap_clone(),
+                    entity_type,
+                    entity_id,
+                },
+                data,
+            });
+        }
+
+        for del in &deletions {
+            let entity_type = del.entity_type();
+            let entity_id = del.id().to_string();
+
+            // See the doc comment of `FindPossibleDeletionsQuery` for details
+            // about why this check is necessary.
+            if !processed_entities.contains(&(entity_type.clone(), entity_id.clone())) {
+                changes.push(EntityOperation::Remove {
+                    key: EntityKey {
+                        subgraph_id: self.site.deployment.cheap_clone(),
+                        entity_type,
+                        entity_id,
+                    },
+                });
+            }
+        }
+
+        Ok(changes)
     }
 
     pub fn insert<'a>(
@@ -618,7 +661,7 @@ impl Layout {
             // 20kB
             const MAXLEN: usize = 20_480;
 
-            if !*graph::log::LOG_SQL_TIMING {
+            if !ENV_VARS.log_sql_timing() {
                 return;
             }
 
@@ -639,7 +682,7 @@ impl Layout {
             );
         }
 
-        let filter_collection = FilterCollection::new(&self, collection, filter.as_ref())?;
+        let filter_collection = FilterCollection::new(self, collection, filter.as_ref())?;
         let query = FilterQuery::new(
             &filter_collection,
             filter.as_ref(),
@@ -658,12 +701,21 @@ impl Layout {
                 }
                 query.load::<EntityData>(conn)
             })
-            .map_err(|e| {
-                QueryExecutionError::ResolveEntitiesError(format!(
-                    "{}, query = {:?}",
+            .map_err(|e| match e {
+                diesel::result::Error::DatabaseError(
+                    diesel::result::DatabaseErrorKind::__Unknown,
+                    ref info,
+                ) if info.message().starts_with("syntax error in tsquery") => {
+                    QueryExecutionError::FulltextQueryInvalidSyntax(info.message().to_string())
+                }
+                diesel::result::Error::QueryBuilderError(e) => {
+                    QueryExecutionError::ResolveEntitiesError(e.to_string())
+                }
+                _ => QueryExecutionError::ResolveEntitiesError(format!(
+                    "{}, query = {}",
                     e,
                     debug_query(&query_clone).to_string()
-                ))
+                )),
             })?;
         log_query_timing(logger, &query_clone, start.elapsed(), values.len());
         values
@@ -684,14 +736,27 @@ impl Layout {
         block: BlockNumber,
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
-        let table = self.table_for_entity(&entity_type)?;
+        let table = self.table_for_entity(entity_type)?;
+        if table.immutable {
+            let ids = entities
+                .into_iter()
+                .map(|(key, _)| key.entity_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(constraint_violation!(
+                "entities of type `{}` can not be updated since they are immutable. Entity ids are [{}]",
+                entity_type,
+                ids
+            ));
+        }
+
         let entity_keys: Vec<&str> = entities
             .iter()
             .map(|(key, _)| key.entity_id.as_str())
             .collect();
 
         let section = stopwatch.start_section("update_modification_clamp_range_query");
-        ClampRangeQuery::new(table, &entity_type, &entity_keys, block).execute(conn)?;
+        ClampRangeQuery::new(table, &entity_keys, block)?.execute(conn)?;
         section.end();
 
         let _section = stopwatch.start_section("update_modification_insert_query");
@@ -716,19 +781,29 @@ impl Layout {
         block: BlockNumber,
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
-        let table = self.table_for_entity(&entity_type)?;
+        let table = self.table_for_entity(entity_type)?;
+        if table.immutable {
+            return Err(constraint_violation!(
+                "entities of type `{}` can not be deleted since they are immutable. Entity ids are [{}]",
+                entity_type, entity_ids.join(", ")
+            ));
+        }
+
         let _section = stopwatch.start_section("delete_modification_clamp_range_query");
         let mut count = 0;
         for chunk in entity_ids.chunks(DELETE_OPERATION_CHUNK_SIZE) {
-            count += ClampRangeQuery::new(table, &entity_type, chunk, block).execute(conn)?
+            count += ClampRangeQuery::new(table, chunk, block)?.execute(conn)?
         }
         Ok(count)
     }
 
+    /// Revert the block with number `block` and all blocks with higher
+    /// numbers. After this operation, only entity versions inserted or
+    /// updated at blocks with numbers strictly lower than `block` will
+    /// remain
     pub fn revert_block(
         &self,
         conn: &PgConnection,
-        subgraph_id: &DeploymentHash,
         block: BlockNumber,
     ) -> Result<(StoreEvent, i32), StoreError> {
         let mut changes: Vec<EntityChange> = Vec::new();
@@ -745,11 +820,15 @@ impl Layout {
             // Make the versions current that existed at `block - 1` but that
             // are not current yet. Those are the ones that were updated or
             // deleted at `block`
-            let unclamped = RevertClampQuery::new(table, block - 1)
-                .get_results(conn)?
-                .into_iter()
-                .map(|data| data.id)
-                .collect::<HashSet<_>>();
+            let unclamped = if table.immutable {
+                HashSet::new()
+            } else {
+                RevertClampQuery::new(table, block - 1)?
+                    .get_results(conn)?
+                    .into_iter()
+                    .map(|data| data.id)
+                    .collect::<HashSet<_>>()
+            };
             // Adjust the entity count; we can tell which operation was
             // initially performed by
             //   id in (unset - unclamped)  => insert (we now deleted)
@@ -763,13 +842,13 @@ impl Layout {
                 .into_iter()
                 .filter(|id| !unclamped.contains(id))
                 .map(|_| EntityChange::Data {
-                    subgraph_id: subgraph_id.clone(),
+                    subgraph_id: self.site.deployment.clone(),
                     entity_type: table.object.clone(),
                 });
             changes.extend(deleted);
             // EntityChange for versions that we just updated or inserted
             let set = unclamped.into_iter().map(|_| EntityChange::Data {
-                subgraph_id: subgraph_id.clone(),
+                subgraph_id: self.site.deployment.clone(),
                 entity_type: table.object.clone(),
             });
             changes.extend(set);
@@ -787,8 +866,8 @@ impl Layout {
         subgraph: &DeploymentHash,
         block: BlockNumber,
     ) -> Result<(), StoreError> {
-        crate::dynds::revert(conn, &subgraph, block)?;
-        crate::deployment::revert_subgraph_errors(conn, &subgraph, block)?;
+        crate::dynds::revert(conn, subgraph, block)?;
+        crate::deployment::revert_subgraph_errors(conn, subgraph, block)?;
 
         Ok(())
     }
@@ -811,7 +890,10 @@ impl Layout {
         let account_like = crate::catalog::account_like(conn, &self.site)?;
         let is_account_like = {
             |table: &Table| {
-                ACCOUNT_TABLES.contains(table.qualified_name.as_str())
+                ENV_VARS
+                    .store
+                    .account_tables
+                    .contains(table.qualified_name.as_str())
                     || account_like.contains(table.name.as_str())
             }
         };
@@ -870,15 +952,12 @@ pub enum ColumnType {
     String,
     TSVector(FulltextConfig),
     Enum(EnumType),
-    /// A `bytea` in SQL, represented as a ValueType::String; this is
-    /// used for `id` columns of type `Bytes`
-    BytesId,
 }
 
 impl From<IdType> for ColumnType {
     fn from(id_type: IdType) -> Self {
         match id_type {
-            IdType::Bytes => ColumnType::BytesId,
+            IdType::Bytes => ColumnType::Bytes,
             IdType::String => ColumnType::String,
         }
     }
@@ -941,7 +1020,6 @@ impl ColumnType {
             ColumnType::String => "text",
             ColumnType::TSVector(_) => "tsvector",
             ColumnType::Enum(enum_type) => enum_type.name.as_str(),
-            ColumnType::BytesId => "bytea",
         }
     }
 
@@ -950,7 +1028,7 @@ impl ColumnType {
     pub(crate) fn id_type(&self) -> IdType {
         match self {
             ColumnType::String => IdType::String,
-            ColumnType::BytesId => IdType::Bytes,
+            ColumnType::Bytes => IdType::Bytes,
             _ => unreachable!(
                 "only String and BytesId are allowed as primary keys but not {:?}",
                 self
@@ -967,6 +1045,9 @@ pub struct Column {
     pub column_type: ColumnType,
     pub fulltext_fields: Option<HashSet<String>>,
     is_reference: bool,
+    /// Whether to use a prefix of the column for comparisons and index
+    /// creation, or column values in their entirety
+    pub use_prefix_comparison: bool,
 }
 
 impl Column {
@@ -995,6 +1076,24 @@ impl Column {
                 is_existing_text_column,
             )?
         };
+        let is_primary_key = sql_name.as_str() == PRIMARY_KEY_COLUMN;
+
+        // When a column has arbitrary size, we only index a prefix of the
+        // column to avoid errors caused by inserting values that are too
+        // large for the index.
+        //
+        // Since we already have installations where `Bytes` columns had
+        // been indexed in their entirety, we remember if a specific
+        // subgraph indexes that, or just a prefix of `Bytes` columns. Query
+        // generation needs to match how these columns are indexed, and we
+        // therefore use that remembered value from `catalog` to determine
+        // if we should use queries for prefixes or for the entire value.
+        let use_prefix_comparison = !is_primary_key
+            && !is_reference
+            && !field.field_type.is_list()
+            && (column_type == ColumnType::String
+                || (column_type == ColumnType::Bytes && catalog.use_bytea_prefix));
+
         Ok(Column {
             name: sql_name,
             field: field.name.clone(),
@@ -1002,6 +1101,7 @@ impl Column {
             field_type: field.field_type.clone(),
             fulltext_fields: None,
             is_reference,
+            use_prefix_comparison,
         })
     }
 
@@ -1012,10 +1112,11 @@ impl Column {
         Ok(Column {
             name: sql_name,
             field: def.name.to_string(),
-            field_type: q::Type::NamedType(String::from("fulltext".to_string())),
+            field_type: q::Type::NamedType("fulltext".to_string()),
             column_type: ColumnType::TSVector(def.config.clone()),
             fulltext_fields: Some(def.included_fields.clone()),
             is_reference: false,
+            use_prefix_comparison: false,
         })
     }
 
@@ -1034,9 +1135,7 @@ impl Column {
     }
 
     pub fn is_list(&self) -> bool {
-        use graph_graphql::prelude::is_list as type_is_list;
-
-        type_is_list(&self.field_type)
+        self.field_type.is_list()
     }
 
     pub fn is_enum(&self) -> bool {
@@ -1053,13 +1152,6 @@ impl Column {
 
     pub fn is_primary_key(&self) -> bool {
         self.name.as_str() == PRIMARY_KEY_COLUMN
-    }
-
-    /// Return `true` if this column stores user-supplied text. Such
-    /// columns may contain very large values and need to be handled
-    /// specially for indexing
-    pub fn is_text(&self) -> bool {
-        named_type(&self.field_type) == "String" && !self.is_list()
     }
 
     pub fn is_assignable_from(&self, source: &Self, object: &EntityType) -> Option<String> {
@@ -1138,6 +1230,10 @@ pub struct Table {
     /// is really only needed for the tests to make the names of indexes
     /// predictable
     position: u32,
+
+    /// Entities in this table are immutable, i.e., will never be updated or
+    /// deleted
+    pub(crate) immutable: bool,
 }
 
 impl Table {
@@ -1157,17 +1253,31 @@ impl Table {
             .iter()
             .filter(|field| !field.is_derived())
             .map(|field| Column::new(&table_name, field, catalog, enums, id_types))
-            .chain(fulltexts.iter().map(|def| Column::new_fulltext(def)))
+            .chain(fulltexts.iter().map(Column::new_fulltext))
             .collect::<Result<Vec<Column>, StoreError>>()?;
         let qualified_name = SqlName::qualified_name(&catalog.site.namespace, &table_name);
-        let is_account_like = ACCOUNT_TABLES.contains(qualified_name.as_str());
+        let is_account_like = ENV_VARS
+            .store
+            .account_tables
+            .contains(qualified_name.as_str());
+
+        let immutable = defn
+            .find_directive("entity")
+            .and_then(|dir| dir.argument("immutable"))
+            .map(|value| match value {
+                q::Value::Boolean(b) => *b,
+                _ => false,
+            })
+            .unwrap_or(false);
+
         let table = Table {
             object: EntityType::from(defn),
-            name: table_name.clone(),
+            name: table_name,
             qualified_name,
             is_account_like,
             columns,
             position,
+            immutable,
         };
         Ok(table)
     }
@@ -1189,7 +1299,7 @@ impl Table {
     pub fn column_for_field(&self, field: &str) -> Result<&Column, StoreError> {
         self.columns
             .iter()
-            .find(|column| &column.field == field)
+            .find(|column| column.field == field)
             .ok_or_else(|| StoreError::UnknownField(field.to_string()))
     }
 
@@ -1226,115 +1336,194 @@ impl Table {
     /// See the unit tests at the end of this file for the actual DDL that
     /// gets generated
     fn as_ddl(&self, out: &mut String, layout: &Layout) -> fmt::Result {
-        writeln!(
-            out,
-            "create table {}.{} (",
-            layout.catalog.site.namespace,
-            self.name.quoted()
-        )?;
-        for column in self.columns.iter() {
-            write!(out, "    ")?;
-            column.as_ddl(out)?;
-            writeln!(out, ",")?;
+        fn columns_ddl(table: &Table) -> Result<String, fmt::Error> {
+            let mut cols = String::new();
+            for column in &table.columns {
+                write!(cols, "    ")?;
+                column.as_ddl(&mut cols)?;
+                writeln!(cols, ",")?;
+            }
+            Ok(cols)
         }
-        // Add block_range column and constraint
-        write!(
-            out,
-            "\n        {vid}                  bigserial primary key,\
-             \n        {block_range}          int4range not null,
-        exclude using gist   (id with =, {block_range} with &&)\n);\n",
-            vid = VID_COLUMN,
-            block_range = BLOCK_RANGE_COLUMN
-        )?;
 
-        // Add a BRIN index on the block_range bounds to exploit the fact
-        // that block ranges closely correlate with where in a table an
-        // entity appears physically. This index is incredibly efficient for
-        // reverts where we look for very recent blocks, so that this index
-        // is highly selective. See https://github.com/graphprotocol/graph-node/issues/1415#issuecomment-630520713
-        // for details on one experiment.
-        //
-        // We do not index the `block_range` as a whole, but rather the lower
-        // and upper bound separately, since experimentation has shown that
-        // Postgres will not use the index on `block_range` for clauses like
-        // `block_range @> $block` but rather falls back to a full table scan.
-        //
-        // We also make sure that we do not put `NULL` in the index for
-        // the upper bound since nulls can not be compared to anything and
-        // will make the index less effective.
-        //
-        // To make the index usable, queries need to have clauses using
-        // `lower(block_range)` and `coalesce(..)` verbatim.
-        //
-        // We also index `vid` as that correlates with the order in which
-        // entities are stored.
-        write!(out,"create index brin_{table_name}\n    \
+        fn create_table(table: &Table, out: &mut String, layout: &Layout) -> fmt::Result {
+            if table.immutable {
+                writeln!(
+                    out,
+                    r#"
+                create table {nsp}.{name} (
+                    {vid}                  bigserial primary key,
+                    {block}                int not null,
+                    {cols}
+                    unique({id})
+                );
+                "#,
+                    nsp = layout.catalog.site.namespace,
+                    name = table.name.quoted(),
+                    cols = columns_ddl(table)?,
+                    vid = VID_COLUMN,
+                    block = BLOCK_COLUMN,
+                    id = table.primary_key().name
+                )
+            } else {
+                writeln!(
+                    out,
+                    r#"
+                create table {nsp}.{name} (
+                    {vid}                  bigserial primary key,
+                    {block_range}          int4range not null,
+                    {cols}
+                    exclude using gist   (id with =, {block_range} with &&)
+                );
+                "#,
+                    nsp = layout.catalog.site.namespace,
+                    name = table.name.quoted(),
+                    cols = columns_ddl(table)?,
+                    vid = VID_COLUMN,
+                    block_range = BLOCK_RANGE_COLUMN
+                )
+            }
+        }
+
+        fn create_time_travel_indexes(
+            table: &Table,
+            out: &mut String,
+            layout: &Layout,
+        ) -> fmt::Result {
+            if table.immutable {
+                write!(
+                    out,
+                    "create index brin_{table_name}\n    \
+                    on {schema_name}.{table_name}\n \
+                       using brin({block}, vid);\n",
+                    table_name = table.name,
+                    schema_name = layout.catalog.site.namespace,
+                    block = BLOCK_COLUMN
+                )
+            } else {
+                // Add a BRIN index on the block_range bounds to exploit the fact
+                // that block ranges closely correlate with where in a table an
+                // entity appears physically. This index is incredibly efficient for
+                // reverts where we look for very recent blocks, so that this index
+                // is highly selective. See https://github.com/graphprotocol/graph-node/issues/1415#issuecomment-630520713
+                // for details on one experiment.
+                //
+                // We do not index the `block_range` as a whole, but rather the lower
+                // and upper bound separately, since experimentation has shown that
+                // Postgres will not use the index on `block_range` for clauses like
+                // `block_range @> $block` but rather falls back to a full table scan.
+                //
+                // We also make sure that we do not put `NULL` in the index for
+                // the upper bound since nulls can not be compared to anything and
+                // will make the index less effective.
+                //
+                // To make the index usable, queries need to have clauses using
+                // `lower(block_range)` and `coalesce(..)` verbatim.
+                //
+                // We also index `vid` as that correlates with the order in which
+                // entities are stored.
+                write!(out,"create index brin_{table_name}\n    \
                     on {schema_name}.{table_name}\n \
                        using brin(lower(block_range), coalesce(upper(block_range), {block_max}), vid);\n",
-            table_name = self.name,
-            schema_name = layout.catalog.site.namespace,
-            block_max = BLOCK_NUMBER_MAX)?;
+                    table_name = table.name,
+                    schema_name = layout.catalog.site.namespace,
+                    block_max = BLOCK_NUMBER_MAX)?;
 
-        // Add a BTree index that helps with the `RevertClampQuery` by making
-        // it faster to find entity versions that have been modified
-        write!(
-            out,
-            "create index {table_name}_block_range_closed\n    \
+                // Add a BTree index that helps with the `RevertClampQuery` by making
+                // it faster to find entity versions that have been modified
+                write!(
+                    out,
+                    "create index {table_name}_block_range_closed\n    \
                      on {schema_name}.{table_name}(coalesce(upper(block_range), {block_max}))\n \
                      where coalesce(upper(block_range), {block_max}) < {block_max};\n",
-            table_name = self.name,
-            schema_name = layout.catalog.site.namespace,
-            block_max = BLOCK_NUMBER_MAX
-        )?;
+                    table_name = table.name,
+                    schema_name = layout.catalog.site.namespace,
+                    block_max = BLOCK_NUMBER_MAX
+                )
+            }
+        }
 
-        // Create indexes. Skip columns whose type is an array of enum,
-        // since there is no good way to index them with Postgres 9.6.
-        // Once we move to Postgres 11, we can enable that
-        // (tracked in graph-node issue #1330)
-        for (i, column) in self
-            .columns
-            .iter()
-            .filter(|col| !(col.is_list() && col.is_enum()))
-            .enumerate()
-        {
-            let (method, index_expr) = if column.is_reference() && !column.is_list() {
-                // For foreign keys, index the key together with the block range
-                // since we almost always also have a block_range clause in
-                // queries that look for specific foreign keys
-                let index_expr = format!("{}, {}", column.name.quoted(), BLOCK_RANGE_COLUMN);
-                ("gist", index_expr)
-            } else {
-                // Attributes that are plain strings are indexed with a BTree; but
-                // they can be too large for Postgres' limit on values that can go
-                // into a BTree. For those attributes, only index the first
-                // STRING_PREFIX_SIZE characters
-                let index_expr = if column.is_text() {
-                    format!("left({}, {})", column.name.quoted(), STRING_PREFIX_SIZE)
+        fn create_attribute_indexes(
+            table: &Table,
+            out: &mut String,
+            layout: &Layout,
+        ) -> fmt::Result {
+            // Create indexes. Skip columns whose type is an array of enum,
+            // since there is no good way to index them with Postgres 9.6.
+            // Once we move to Postgres 11, we can enable that
+            // (tracked in graph-node issue #1330)
+            for (i, column) in table
+                .columns
+                .iter()
+                .filter(|col| !(col.is_list() && col.is_enum()))
+                .enumerate()
+            {
+                if table.immutable && column.is_primary_key() {
+                    // We create a unique index on `id` in `create_table`
+                    // and don't need an explicit attribute index
+                    continue;
+                }
+
+                let (method, index_expr) = if column.is_reference() && !column.is_list() {
+                    // For foreign keys, index the key together with the block range
+                    // since we almost always also have a block_range clause in
+                    // queries that look for specific foreign keys
+                    if table.immutable {
+                        let index_expr = format!("{}, {}", column.name.quoted(), BLOCK_COLUMN);
+                        ("btree", index_expr)
+                    } else {
+                        let index_expr =
+                            format!("{}, {}", column.name.quoted(), BLOCK_RANGE_COLUMN);
+                        ("gist", index_expr)
+                    }
                 } else {
-                    column.name.quoted()
-                };
+                    // Attributes that are plain strings or bytes are
+                    // indexed with a BTree; but they can be too large for
+                    // Postgres' limit on values that can go into a BTree.
+                    // For those attributes, only index the first
+                    // STRING_PREFIX_SIZE or BYTE_ARRAY_PREFIX_SIZE characters
+                    let index_expr = if column.use_prefix_comparison {
+                        match column.column_type {
+                            ColumnType::String => {
+                                format!("left({}, {})", column.name.quoted(), STRING_PREFIX_SIZE)
+                            }
+                            ColumnType::Bytes => format!(
+                                "substring({}, 1, {})",
+                                column.name.quoted(),
+                                BYTE_ARRAY_PREFIX_SIZE
+                            ),
+                            _ => unreachable!("only String and Bytes can have arbitrary size"),
+                        }
+                    } else {
+                        column.name.quoted()
+                    };
 
-                let method = if column.is_list() || column.is_fulltext() {
-                    "gin"
-                } else {
-                    "btree"
-                };
+                    let method = if column.is_list() || column.is_fulltext() {
+                        "gin"
+                    } else {
+                        "btree"
+                    };
 
-                (method, index_expr)
-            };
-            write!(
+                    (method, index_expr)
+                };
+                write!(
                 out,
                 "create index attr_{table_index}_{column_index}_{table_name}_{column_name}\n    on {schema_name}.\"{table_name}\" using {method}({index_expr});\n",
-                table_index = self.position,
-                table_name = self.name,
+                table_index = table.position,
+                table_name = table.name,
                 column_index = i,
                 column_name = column.name,
                 schema_name = layout.catalog.site.namespace,
                 method = method,
                 index_expr = index_expr,
             )?;
+            }
+            writeln!(out)
         }
-        writeln!(out)
+
+        create_table(self, out, layout)?;
+        create_time_travel_indexes(self, out, layout)?;
+        create_attribute_indexes(self, out, layout)
     }
 }
 
@@ -1382,15 +1571,9 @@ impl LayoutCache {
     }
 
     fn load(conn: &PgConnection, site: Arc<Site>) -> Result<Arc<Layout>, StoreError> {
-        let subgraph_schema = deployment::schema(conn, site.as_ref())?;
-        let has_poi = crate::catalog::supports_proof_of_indexing(conn, &site.namespace)?;
-        let catalog = Catalog::new(conn, site.clone())?;
-        let layout = Arc::new(Layout::new(
-            site.clone(),
-            &subgraph_schema,
-            catalog,
-            has_poi,
-        )?);
+        let (subgraph_schema, use_bytea_prefix) = deployment::schema(conn, site.as_ref())?;
+        let catalog = Catalog::load(conn, site.clone(), use_bytea_prefix)?;
+        let layout = Arc::new(Layout::new(site.clone(), &subgraph_schema, catalog)?);
         layout.refresh(conn, site)
     }
 
@@ -1440,8 +1623,8 @@ impl LayoutCache {
                     // simultaneously. It's easiest to refresh at most one
                     // layout globally
                     let refresh = self.refresh.try_lock();
-                    if let Err(_) = refresh {
-                        return Ok(value.clone());
+                    if refresh.is_err() {
+                        return Ok(value);
                     }
                     match value.cheap_clone().refresh(conn, site) {
                         Err(e) => {
@@ -1480,6 +1663,8 @@ impl LayoutCache {
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
+
     use super::*;
 
     use crate::layout_for_tests::make_dummy_site;
@@ -1491,8 +1676,8 @@ mod tests {
         let schema = Schema::parse(gql, subgraph.clone()).expect("Test schema invalid");
         let namespace = Namespace::new("sgd0815".to_owned()).unwrap();
         let site = Arc::new(make_dummy_site(subgraph, namespace, "anet".to_string()));
-        let catalog = Catalog::make_empty(site.clone()).expect("Can not create catalog");
-        Layout::new(site, &schema, catalog, false).expect("Failed to construct Layout")
+        let catalog = Catalog::for_tests(site.clone()).expect("Can not create catalog");
+        Layout::new(site, &schema, catalog).expect("Failed to construct Layout")
     }
 
     #[test]
@@ -1523,25 +1708,37 @@ mod tests {
 
     #[test]
     fn generate_ddl() {
+        // Check that the two strings are the same after replacing runs of
+        // whitespace with a single space
+        #[track_caller]
+        fn check_eqv(left: &str, right: &str) {
+            let left_s = left.split_whitespace().join(" ");
+            let right_s = right.split_whitespace().join(" ");
+            if left_s != right_s {
+                // Make sure the original strings show up in the error message
+                assert_eq!(left, right);
+            }
+        }
+
         let layout = test_layout(THING_GQL);
         let sql = layout.as_ddl().expect("Failed to generate DDL");
-        assert_eq!(THING_DDL, sql);
+        check_eqv(THING_DDL, &sql);
 
         let layout = test_layout(MUSIC_GQL);
         let sql = layout.as_ddl().expect("Failed to generate DDL");
-        assert_eq!(MUSIC_DDL, sql);
+        check_eqv(MUSIC_DDL, &sql);
 
         let layout = test_layout(FOREST_GQL);
         let sql = layout.as_ddl().expect("Failed to generate DDL");
-        assert_eq!(FOREST_DDL, sql);
+        check_eqv(FOREST_DDL, &sql);
 
         let layout = test_layout(FULLTEXT_GQL);
         let sql = layout.as_ddl().expect("Failed to generate DDL");
-        assert_eq!(FULLTEXT_DDL, sql);
+        check_eqv(FULLTEXT_DDL, &sql);
 
         let layout = test_layout(FORWARD_ENUM_GQL);
         let sql = layout.as_ddl().expect("Failed to generate DDL");
-        assert_eq!(FORWARD_ENUM_SQL, sql);
+        check_eqv(FORWARD_ENUM_SQL, &sql);
     }
 
     #[test]
@@ -1645,11 +1842,11 @@ mod tests {
 create type sgd0815.\"size\"
     as enum (\'large\', \'medium\', \'small\');
 create table sgd0815.\"thing\" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
         \"id\"                 text not null,
         \"big_thing\"          text not null,
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_thing
@@ -1664,6 +1861,8 @@ create index attr_0_1_thing_big_thing
     on sgd0815.\"thing\" using gist(\"big_thing\", block_range);
 
 create table sgd0815.\"scalar\" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
         \"id\"                 text not null,
         \"bool\"               boolean,
         \"int\"                integer,
@@ -1673,8 +1872,6 @@ create table sgd0815.\"scalar\" (
         \"big_int\"            numeric,
         \"color\"              \"sgd0815\".\"color\",
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_scalar
@@ -1694,7 +1891,7 @@ create index attr_1_3_scalar_big_decimal
 create index attr_1_4_scalar_string
     on sgd0815.\"scalar\" using btree(left(\"string\", 256));
 create index attr_1_5_scalar_bytes
-    on sgd0815.\"scalar\" using btree(\"bytes\");
+    on sgd0815.\"scalar\" using btree(substring(\"bytes\", 1, 64));
 create index attr_1_6_scalar_big_int
     on sgd0815.\"scalar\" using btree(\"big_int\");
 create index attr_1_7_scalar_color
@@ -1717,7 +1914,7 @@ type Band @entity {
     originalSongs: [Song!]!
 }
 
-type Song @entity {
+type Song @entity(immutable: true) {
     id: ID!
     title: String!
     writtenBy: Musician!
@@ -1730,13 +1927,13 @@ type SongStat @entity {
     played: Int!
 }";
     const MUSIC_DDL: &str = "create table sgd0815.\"musician\" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
         \"id\"                 text not null,
         \"name\"               text not null,
         \"main_band\"          text,
         \"bands\"              text[] not null,
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_musician
@@ -1755,12 +1952,12 @@ create index attr_0_3_musician_bands
     on sgd0815.\"musician\" using gin(\"bands\");
 
 create table sgd0815.\"band\" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
         \"id\"                 text not null,
         \"name\"               text not null,
         \"original_songs\"     text[] not null,
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_band
@@ -1777,33 +1974,28 @@ create index attr_1_2_band_original_songs
     on sgd0815.\"band\" using gin(\"original_songs\");
 
 create table sgd0815.\"song\" (
+        vid                    bigserial primary key,
+        block$                 int not null,
         \"id\"                 text not null,
         \"title\"              text not null,
         \"written_by\"         text not null,
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
+        unique(id)
 );
 create index brin_song
     on sgd0815.song
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index song_block_range_closed
-    on sgd0815.song(coalesce(upper(block_range), 2147483647))
- where coalesce(upper(block_range), 2147483647) < 2147483647;
-create index attr_2_0_song_id
-    on sgd0815.\"song\" using btree(\"id\");
+ using brin(block$, vid);
 create index attr_2_1_song_title
     on sgd0815.\"song\" using btree(left(\"title\", 256));
 create index attr_2_2_song_written_by
-    on sgd0815.\"song\" using gist(\"written_by\", block_range);
+    on sgd0815.\"song\" using btree(\"written_by\", block$);
 
 create table sgd0815.\"song_stat\" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
         \"id\"                 text not null,
         \"played\"             integer not null,
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_song_stat
@@ -1841,11 +2033,11 @@ type Habitat @entity {
 }";
 
     const FOREST_DDL: &str = "create table sgd0815.\"animal\" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
         \"id\"                 text not null,
         \"forest\"             text,
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_animal
@@ -1860,10 +2052,10 @@ create index attr_0_1_animal_forest
     on sgd0815.\"animal\" using gist(\"forest\", block_range);
 
 create table sgd0815.\"forest\" (
-        \"id\"                 text not null,
-
         vid                  bigserial primary key,
         block_range          int4range not null,
+        \"id\"                 text not null,
+
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_forest
@@ -1876,12 +2068,12 @@ create index attr_1_0_forest_id
     on sgd0815.\"forest\" using btree(\"id\");
 
 create table sgd0815.\"habitat\" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
         \"id\"                 text not null,
         \"most_common\"        text not null,
         \"dwellers\"           text[] not null,
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_habitat
@@ -1930,14 +2122,14 @@ type Habitat @entity {
 }";
 
     const FULLTEXT_DDL: &str = "create table sgd0815.\"animal\" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
         \"id\"                 text not null,
         \"name\"               text not null,
         \"species\"            text not null,
         \"forest\"             text,
         \"search\"             tsvector,
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_animal
@@ -1958,10 +2150,10 @@ create index attr_0_4_animal_search
     on sgd0815.\"animal\" using gin(\"search\");
 
 create table sgd0815.\"forest\" (
-        \"id\"                 text not null,
-
         vid                  bigserial primary key,
         block_range          int4range not null,
+        \"id\"                 text not null,
+
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_forest
@@ -1974,12 +2166,12 @@ create index attr_1_0_forest_id
     on sgd0815.\"forest\" using btree(\"id\");
 
 create table sgd0815.\"habitat\" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
         \"id\"                 text not null,
         \"most_common\"        text not null,
         \"dwellers\"           text[] not null,
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_habitat
@@ -2011,11 +2203,11 @@ enum Orientation {
     const FORWARD_ENUM_SQL: &str = "create type sgd0815.\"orientation\"
     as enum (\'DOWN\', \'UP\');
 create table sgd0815.\"thing\" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
         \"id\"                 text not null,
         \"orientation\"        \"sgd0815\".\"orientation\" not null,
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
         exclude using gist   (id with =, block_range with &&)
 );
 create index brin_thing

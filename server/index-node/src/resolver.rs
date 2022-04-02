@@ -1,53 +1,53 @@
 use either::Either;
-use graph::blockchain::{Blockchain, BlockchainKind};
-use std::collections::{BTreeMap, HashMap};
-
-use graph::data::subgraph::features::detect_features;
-use graph::data::subgraph::{status, MAX_SPEC_VERSION};
-use graph::prelude::*;
-use graph::{
-    components::store::StatusStore,
-    data::graphql::{IntoValue, ObjectOrInterface, ValueMap},
-};
-use graph_graphql::prelude::{ExecutionContext, Resolver};
+use std::collections::BTreeMap;
 use std::convert::TryInto;
 use web3::types::{Address, H256};
 
+use graph::blockchain::{Blockchain, BlockchainKind, BlockchainMap};
+use graph::components::store::{BlockStore, EntityType, Store};
+use graph::data::graphql::{object, IntoValue, ObjectOrInterface, ValueMap};
+use graph::data::subgraph::features::detect_features;
+use graph::data::subgraph::status;
+use graph::data::value::Object;
+use graph::prelude::*;
+use graph_graphql::prelude::{a, ExecutionContext, Resolver};
+
+use crate::auth::PoiProtection;
+
 /// Resolver for the index node GraphQL API.
-pub struct IndexNodeResolver<S, R, St> {
+pub struct IndexNodeResolver<S, R> {
     logger: Logger,
+    blockchain_map: Arc<BlockchainMap>,
     store: Arc<S>,
     link_resolver: Arc<R>,
-    subgraph_store: Arc<St>,
+    bearer_token: Option<String>,
 }
 
-impl<S, R, St> IndexNodeResolver<S, R, St>
+impl<S, R> IndexNodeResolver<S, R>
 where
-    S: StatusStore,
+    S: Store,
     R: LinkResolver,
-    St: SubgraphStore,
 {
     pub fn new(
         logger: &Logger,
         store: Arc<S>,
         link_resolver: Arc<R>,
-        subgraph_store: Arc<St>,
+        bearer_token: Option<String>,
+        blockchain_map: Arc<BlockchainMap>,
     ) -> Self {
         let logger = logger.new(o!("component" => "IndexNodeResolver"));
         Self {
             logger,
+            blockchain_map,
             store,
             link_resolver,
-            subgraph_store,
+            bearer_token,
         }
     }
 
-    fn resolve_indexing_statuses(
-        &self,
-        arguments: &HashMap<&str, r::Value>,
-    ) -> Result<r::Value, QueryExecutionError> {
-        let deployments = arguments
-            .get("subgraphs")
+    fn resolve_indexing_statuses(&self, field: &a::Field) -> Result<r::Value, QueryExecutionError> {
+        let deployments = field
+            .argument_value("subgraphs")
             .map(|value| match value {
                 r::Value::List(ids) => ids
                     .into_iter()
@@ -68,12 +68,12 @@ where
 
     fn resolve_indexing_statuses_for_subgraph_name(
         &self,
-        arguments: &HashMap<&str, r::Value>,
+        field: &a::Field,
     ) -> Result<r::Value, QueryExecutionError> {
         // Get the subgraph name from the arguments; we can safely use `expect` here
         // because the argument will already have been validated prior to the resolver
         // being called
-        let subgraph_name = arguments
+        let subgraph_name = field
             .get_required::<String>("subgraphName")
             .expect("subgraphName not provided");
 
@@ -90,31 +90,187 @@ where
         Ok(infos.into_value())
     }
 
-    fn resolve_proof_of_indexing(
+    fn resolve_entity_changes_in_block(
         &self,
-        argument_values: &HashMap<&str, r::Value>,
+        field: &a::Field,
     ) -> Result<r::Value, QueryExecutionError> {
-        let deployment_id = argument_values
+        let subgraph_id = field
+            .get_required::<DeploymentHash>("subgraphId")
+            .expect("Valid subgraphId required");
+
+        let block_number = field
+            .get_required::<BlockNumber>("blockNumber")
+            .expect("Valid blockNumber required");
+
+        let entity_changes = self
+            .store
+            .subgraph_store()
+            .entity_changes_in_block(&subgraph_id, block_number)?;
+
+        Ok(entity_changes_to_graphql(entity_changes))
+    }
+
+    fn resolve_block_data(&self, field: &a::Field) -> Result<r::Value, QueryExecutionError> {
+        let network = field
+            .get_required::<String>("network")
+            .expect("Valid network required");
+
+        let block_hash = field
+            .get_required::<H256>("blockHash")
+            .expect("Valid blockHash required");
+
+        let chain_store = if let Some(cs) = self.store.block_store().chain_store(&network) {
+            cs
+        } else {
+            error!(
+                self.logger,
+                "Failed to fetch block data; nonexistent network";
+                "network" => network,
+                "block_hash" => format!("{}", block_hash),
+            );
+            return Ok(r::Value::Null);
+        };
+
+        let blocks_res = chain_store.blocks(&[block_hash]);
+        Ok(match blocks_res {
+            Ok(blocks) if blocks.is_empty() => {
+                error!(
+                    self.logger,
+                    "Failed to fetch block data; block not found";
+                    "network" => network,
+                    "block_hash" => format!("{}", block_hash),
+                );
+                r::Value::Null
+            }
+            Ok(mut blocks) => {
+                assert!(blocks.len() == 1, "Multiple blocks with the same hash");
+                blocks.pop().unwrap().into()
+            }
+            Err(e) => {
+                error!(
+                    self.logger,
+                    "Failed to fetch block data; storage error";
+                    "network" => network.as_str(),
+                    "block_hash" => format!("{}", block_hash),
+                    "error" => e.to_string(),
+                );
+                r::Value::Null
+            }
+        })
+    }
+
+    fn resolve_cached_ethereum_calls(
+        &self,
+        field: &a::Field,
+    ) -> Result<r::Value, QueryExecutionError> {
+        let network = field
+            .get_required::<String>("network")
+            .expect("Valid network required");
+
+        let block_hash = field
+            .get_required::<H256>("blockHash")
+            .expect("Valid blockHash required");
+
+        let chain = if let Ok(c) = self
+            .blockchain_map
+            .get::<graph_chain_ethereum::Chain>(network.clone())
+        {
+            c
+        } else {
+            error!(
+                self.logger,
+                "Failed to fetch cached Ethereum calls; nonexistent network";
+                "network" => network,
+                "block_hash" => format!("{}", block_hash),
+            );
+            return Ok(r::Value::Null);
+        };
+        let chain_store = chain.chain_store();
+        let call_cache = chain.call_cache();
+
+        let block_number = match chain_store.block_number(block_hash) {
+            Ok(Some((_, n))) => n,
+            Ok(None) => {
+                error!(
+                    self.logger,
+                    "Failed to fetch cached Ethereum calls; block not found";
+                    "network" => network,
+                    "block_hash" => format!("{}", block_hash),
+                );
+                return Ok(r::Value::Null);
+            }
+            Err(e) => {
+                error!(
+                    self.logger,
+                    "Failed to fetch cached Ethereum calls; storage error";
+                    "network" => network.as_str(),
+                    "block_hash" => format!("{}", block_hash),
+                    "error" => e.to_string(),
+                );
+                return Ok(r::Value::Null);
+            }
+        };
+        let block_ptr = BlockPtr::new(block_hash.into(), block_number);
+
+        let calls = match call_cache.get_calls_in_block(block_ptr) {
+            Ok(c) => c,
+            Err(e) => {
+                error!(
+                    self.logger,
+                    "Failed to fetch cached Ethereum calls; storage error";
+                    "network" => network.as_str(),
+                    "block_hash" => format!("{}", block_hash),
+                    "error" => e.to_string(),
+                );
+                return Err(QueryExecutionError::StoreError(Error::from(e).into()));
+            }
+        };
+
+        Ok(r::Value::List(
+            calls
+                .into_iter()
+                .map(|cached_call| {
+                    object! {
+                        idHash: &cached_call.blake3_id[..],
+                        block: object! {
+                            hash: cached_call.block_ptr.hash.hash_hex(),
+                            number: cached_call.block_ptr.number,
+                        },
+                        contractAddress: &cached_call.contract_address[..],
+                        returnValue: &cached_call.return_value[..],
+                    }
+                })
+                .collect::<Vec<r::Value>>(),
+        ))
+    }
+
+    fn resolve_proof_of_indexing(&self, field: &a::Field) -> Result<r::Value, QueryExecutionError> {
+        let deployment_id = field
             .get_required::<DeploymentHash>("subgraph")
             .expect("Valid subgraphId required");
 
-        let block_number: u64 = argument_values
+        let block_number: u64 = field
             .get_required::<u64>("blockNumber")
             .expect("Valid blockNumber required")
             .try_into()
             .unwrap();
 
-        let block_hash = argument_values
+        let block_hash = field
             .get_required::<H256>("blockHash")
-            .expect("Valid blockHash required")
-            .try_into()
-            .unwrap();
+            .expect("Valid blockHash required");
 
         let block = BlockPtr::from((block_hash, block_number));
 
-        let indexer = argument_values
+        let mut indexer = field
             .get_optional::<Address>("indexer")
             .expect("Invalid indexer");
+
+        let poi_protection = PoiProtection::from_env(&ENV_VARS);
+        if !poi_protection.validate_access_token(self.bearer_token.as_deref()) {
+            // Let's sign the POI with a zero'd address when the access token is
+            // invalid.
+            indexer = Some(Address::zero());
+        }
 
         let poi_fut = self
             .store
@@ -139,13 +295,13 @@ where
 
     fn resolve_indexing_status_for_version(
         &self,
-        arguments: &HashMap<&str, r::Value>,
+        field: &a::Field,
 
         // If `true` return the current version, if `false` return the pending version.
         current_version: bool,
     ) -> Result<r::Value, QueryExecutionError> {
         // We can safely unwrap because the argument is non-nullable and has been validated.
-        let subgraph_name = arguments.get_required::<String>("subgraphName").unwrap();
+        let subgraph_name = field.get_required::<String>("subgraphName").unwrap();
 
         debug!(
             self.logger,
@@ -168,10 +324,10 @@ where
 
     async fn resolve_subgraph_features(
         &self,
-        arguments: &HashMap<&str, r::Value>,
+        field: &a::Field,
     ) -> Result<r::Value, QueryExecutionError> {
         // We can safely unwrap because the argument is non-nullable and has been validated.
-        let subgraph_id = arguments.get_required::<String>("subgraphId").unwrap();
+        let subgraph_id = field.get_required::<String>("subgraphId").unwrap();
 
         // TODO:
         //
@@ -213,14 +369,33 @@ where
                             raw,
                             self.link_resolver.clone(),
                             &self.logger,
-                            MAX_SPEC_VERSION.clone(),
+                            ENV_VARS.max_spec_version.clone(),
                         )
                         .await?;
 
                     validate_and_extract_features(
-                        &self.subgraph_store,
+                        &self.store.subgraph_store(),
                         unvalidated_subgraph_manifest,
-                    )?
+                    )
+                    .await?
+                }
+
+                BlockchainKind::Tendermint => {
+                    let unvalidated_subgraph_manifest =
+                        UnvalidatedSubgraphManifest::<graph_chain_tendermint::Chain>::resolve(
+                            deployment_hash,
+                            raw,
+                            self.link_resolver.clone(),
+                            &self.logger,
+                            ENV_VARS.max_spec_version.clone(),
+                        )
+                        .await?;
+
+                    validate_and_extract_features(
+                        &self.store.subgraph_store(),
+                        unvalidated_subgraph_manifest,
+                    )
+                    .await?
                 }
 
                 BlockchainKind::Near => {
@@ -230,21 +405,22 @@ where
                             raw,
                             self.link_resolver.clone(),
                             &self.logger,
-                            MAX_SPEC_VERSION.clone(),
+                            ENV_VARS.max_spec_version.clone(),
                         )
                         .await?;
 
                     validate_and_extract_features(
-                        &self.subgraph_store,
+                        &self.store.subgraph_store(),
                         unvalidated_subgraph_manifest,
-                    )?
+                    )
+                    .await?
                 }
             }
         };
 
         // We then bulid a GraphqQL `Object` value that contains the feature detection and
         // validation results and send it back as a response.
-        let mut response: BTreeMap<String, r::Value> = BTreeMap::new();
+        let mut response = Object::new();
         response.insert("features".to_string(), features);
         response.insert("errors".to_string(), errors);
         response.insert("network".to_string(), network);
@@ -259,47 +435,49 @@ struct ValidationPostProcessResult {
     network: r::Value,
 }
 
-fn validate_and_extract_features<C, St>(
-    subgraph_store: &Arc<St>,
+async fn validate_and_extract_features<C, SgStore>(
+    subgraph_store: &Arc<SgStore>,
     unvalidated_subgraph_manifest: UnvalidatedSubgraphManifest<C>,
 ) -> Result<ValidationPostProcessResult, QueryExecutionError>
 where
     C: Blockchain,
-    St: SubgraphStore,
+    SgStore: SubgraphStore,
 {
     // Validate the subgraph we've just obtained.
     //
     // Note that feature valiadation errors will be inside the error variant vector (because
     // `validate` also validates subgraph features), so we must filter them out to build our
     // response.
-    let subgraph_validation: Either<_, _> =
-        match unvalidated_subgraph_manifest.validate(subgraph_store.clone(), false) {
-            Ok(subgraph_manifest) => Either::Left(subgraph_manifest),
-            Err(validation_errors) => {
-                // We must ensure that all the errors are of the `FeatureValidationError`
-                // variant and that there is at least one error of that kind.
-                let feature_validation_errors: Vec<_> = validation_errors
-                    .into_iter()
-                    .filter(|error| {
-                        matches!(
-                            error,
-                            SubgraphManifestValidationError::FeatureValidationError(_)
-                        )
-                    })
-                    .collect();
+    let subgraph_validation: Either<_, _> = match unvalidated_subgraph_manifest
+        .validate(subgraph_store.clone(), false)
+        .await
+    {
+        Ok(subgraph_manifest) => Either::Left(subgraph_manifest),
+        Err(validation_errors) => {
+            // We must ensure that all the errors are of the `FeatureValidationError`
+            // variant and that there is at least one error of that kind.
+            let feature_validation_errors: Vec<_> = validation_errors
+                .into_iter()
+                .filter(|error| {
+                    matches!(
+                        error,
+                        SubgraphManifestValidationError::FeatureValidationError(_)
+                    )
+                })
+                .collect();
 
-                if !feature_validation_errors.is_empty() {
-                    Either::Right(feature_validation_errors)
-                } else {
-                    // If other error variants are present or there are no feature validation
-                    // errors, we must return early with an error.
-                    //
-                    // It might be useful to return a more thoughtful error, but that is not the
-                    // purpose of this endpoint.
-                    return Err(QueryExecutionError::InvalidSubgraphManifest);
-                }
+            if !feature_validation_errors.is_empty() {
+                Either::Right(feature_validation_errors)
+            } else {
+                // If other error variants are present or there are no feature validation
+                // errors, we must return early with an error.
+                //
+                // It might be useful to return a more thoughtful error, but that is not the
+                // purpose of this endpoint.
+                return Err(QueryExecutionError::InvalidSubgraphManifest);
             }
-        };
+        }
+    };
 
     // At this point, we have either:
     // 1. A valid subgraph manifest with no errors.
@@ -344,28 +522,87 @@ where
     }
 }
 
-impl<S, R, St> Clone for IndexNodeResolver<S, R, St>
+fn entity_changes_to_graphql(entity_changes: Vec<EntityOperation>) -> r::Value {
+    // Results are sorted first alphabetically by entity type, then by entity
+    // ID, and then aphabetically by field name.
+
+    // First, we isolate updates and deletions with the same entity type.
+    let mut updates: BTreeMap<EntityType, Vec<Entity>> = BTreeMap::new();
+    let mut deletions: BTreeMap<EntityType, Vec<String>> = BTreeMap::new();
+
+    for change in entity_changes {
+        match change {
+            EntityOperation::Remove { key } => {
+                deletions
+                    .entry(key.entity_type)
+                    .or_default()
+                    .push(key.entity_id);
+            }
+            EntityOperation::Set { key, data } => {
+                updates.entry(key.entity_type).or_default().push(data);
+            }
+        }
+    }
+
+    // Now we're ready for GraphQL type conversions.
+    let mut updates_graphql: Vec<r::Value> = Vec::with_capacity(updates.len());
+    let mut deletions_graphql: Vec<r::Value> = Vec::with_capacity(deletions.len());
+
+    for (entity_type, mut entities) in updates {
+        entities.sort_unstable_by_key(|e| e.id().unwrap_or("no-id".to_string()));
+        updates_graphql.push(object! {
+            type: entity_type.to_string(),
+            entities:
+                entities
+                    .into_iter()
+                    .map(|e| {
+                        r::Value::object(
+                            e.sorted()
+                                .into_iter()
+                                .map(|(name, value)| (name, value.into()))
+                                .collect(),
+                        )
+                    })
+                    .collect::<Vec<r::Value>>(),
+        });
+    }
+
+    for (entity_type, mut ids) in deletions {
+        ids.sort_unstable();
+        deletions_graphql.push(object! {
+            type: entity_type.to_string(),
+            entities:
+                ids.into_iter().map(r::Value::String).collect::<Vec<r::Value>>(),
+        });
+    }
+
+    object! {
+        updates: updates_graphql,
+        deletions: deletions_graphql,
+    }
+}
+
+impl<S, R> Clone for IndexNodeResolver<S, R>
 where
-    S: SubgraphStore,
-    R: LinkResolver,
-    St: SubgraphStore,
+    S: Clone,
+    R: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             logger: self.logger.clone(),
+            blockchain_map: self.blockchain_map.clone(),
             store: self.store.clone(),
             link_resolver: self.link_resolver.clone(),
-            subgraph_store: self.subgraph_store.clone(),
+            bearer_token: self.bearer_token.clone(),
         }
     }
 }
 
 #[async_trait]
-impl<S, R, St> Resolver for IndexNodeResolver<S, R, St>
+impl<S, R> Resolver for IndexNodeResolver<S, R>
 where
-    S: StatusStore,
+    S: Store,
     R: LinkResolver,
-    St: SubgraphStore,
 {
     const CACHEABLE: bool = false;
 
@@ -376,7 +613,7 @@ where
     fn prefetch(
         &self,
         _: &ExecutionContext<Self>,
-        _: &q::SelectionSet,
+        _: &a::SelectionSet,
     ) -> Result<Option<r::Value>, Vec<QueryExecutionError>> {
         Ok(None)
     }
@@ -385,43 +622,43 @@ where
     fn resolve_scalar_value(
         &self,
         parent_object_type: &s::ObjectType,
-        field: &q::Field,
+        field: &a::Field,
         scalar_type: &s::ScalarType,
         value: Option<r::Value>,
-        argument_values: &HashMap<&str, r::Value>,
     ) -> Result<r::Value, QueryExecutionError> {
-        // Check if we are resolving the proofOfIndexing bytes
-        if &parent_object_type.name == "Query"
-            && &field.name == "proofOfIndexing"
-            && &scalar_type.name == "Bytes"
-        {
-            return self.resolve_proof_of_indexing(argument_values);
-        }
+        match (
+            parent_object_type.name.as_str(),
+            field.name.as_str(),
+            scalar_type.name.as_str(),
+        ) {
+            ("Query", "proofOfIndexing", "Bytes") => self.resolve_proof_of_indexing(field),
+            ("Query", "blockData", "JSONObject") => self.resolve_block_data(field),
 
-        // Fallback to the same as is in the default trait implementation. There
-        // is no way to call back into the default implementation for the trait.
-        // So, note that this is duplicated.
-        // See also c2112309-44fd-4a84-92a0-5a651e6ed548
-        Ok(value.unwrap_or(r::Value::Null))
+            // Fallback to the same as is in the default trait implementation. There
+            // is no way to call back into the default implementation for the trait.
+            // So, note that this is duplicated.
+            // See also c2112309-44fd-4a84-92a0-5a651e6ed548
+            _ => Ok(value.unwrap_or(r::Value::Null)),
+        }
     }
 
     fn resolve_objects(
         &self,
         prefetched_objects: Option<r::Value>,
-        field: &q::Field,
+        field: &a::Field,
         _field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-        arguments: &HashMap<&str, r::Value>,
     ) -> Result<r::Value, QueryExecutionError> {
+        // Resolves the `field.name` top-level field.
         match (prefetched_objects, object_type.name(), field.name.as_str()) {
-            // The top-level `indexingStatuses` field
             (None, "SubgraphIndexingStatus", "indexingStatuses") => {
-                self.resolve_indexing_statuses(arguments)
+                self.resolve_indexing_statuses(field)
             }
-
-            // The top-level `indexingStatusesForSubgraphName` field
             (None, "SubgraphIndexingStatus", "indexingStatusesForSubgraphName") => {
-                self.resolve_indexing_statuses_for_subgraph_name(arguments)
+                self.resolve_indexing_statuses_for_subgraph_name(field)
+            }
+            (None, "CachedEthereumCall", "cachedEthereumCalls") => {
+                self.resolve_cached_ethereum_calls(field)
             }
 
             // Resolve fields of `Object` values (e.g. the `chains` field of `ChainIndexingStatus`)
@@ -432,26 +669,20 @@ where
     fn resolve_object(
         &self,
         prefetched_object: Option<r::Value>,
-        field: &q::Field,
+        field: &a::Field,
         _field_definition: &s::Field,
         _object_type: ObjectOrInterface<'_>,
-        arguments: &HashMap<&str, r::Value>,
     ) -> Result<r::Value, QueryExecutionError> {
+        // Resolves the `field.name` top-level field.
         match (prefetched_object, field.name.as_str()) {
-            // The top-level `indexingStatusForCurrentVersion` field
             (None, "indexingStatusForCurrentVersion") => {
-                self.resolve_indexing_status_for_version(arguments, true)
+                self.resolve_indexing_status_for_version(field, true)
             }
-
-            // The top-level `indexingStatusForPendingVersion` field
             (None, "indexingStatusForPendingVersion") => {
-                self.resolve_indexing_status_for_version(arguments, false)
+                self.resolve_indexing_status_for_version(field, false)
             }
-
-            // The top-level `indexingStatusForPendingVersion` field
-            (None, "subgraphFeatures") => {
-                graph::block_on(self.resolve_subgraph_features(arguments))
-            }
+            (None, "subgraphFeatures") => graph::block_on(self.resolve_subgraph_features(field)),
+            (None, "entityChangesInBlock") => self.resolve_entity_changes_in_block(field),
 
             // Resolve fields of `Object` values (e.g. the `latestBlock` field of `EthereumBlock`)
             (value, _) => Ok(value.unwrap_or(r::Value::Null)),

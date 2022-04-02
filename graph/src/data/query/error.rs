@@ -41,6 +41,7 @@ pub enum QueryExecutionError {
     AbstractTypeError(String),
     InvalidArgumentError(Pos, String, q::Value),
     MissingArgumentError(Pos, String),
+    ValidationError(Option<Pos>, String),
     InvalidVariableTypeError(Pos, String),
     MissingVariableError(Pos, String),
     ResolveEntitiesError(String),
@@ -77,6 +78,7 @@ pub enum QueryExecutionError {
     Panic(String),
     EventStreamError,
     FulltextQueryRequiresFilter,
+    FulltextQueryInvalidSyntax(String),
     DeploymentReverted,
     SubgraphManifestResolveError(Arc<SubgraphManifestResolveError>),
     InvalidSubgraphManifest,
@@ -113,6 +115,7 @@ impl QueryExecutionError {
             | Unimplemented(_)
             | CyclicalFragment(_)
             | UndefinedFragment(_)
+            | FulltextQueryInvalidSyntax(_)
             | FulltextQueryRequiresFilter => true,
             NonNullError(_, _)
             | ListValueError(_, _)
@@ -135,6 +138,7 @@ impl QueryExecutionError {
             | DeploymentReverted
             | SubgraphManifestResolveError(_)
             | InvalidSubgraphManifest
+            | ValidationError(_, _)
             | ResultTooBig(_, _) => false,
         }
     }
@@ -158,6 +162,9 @@ impl fmt::Display for QueryExecutionError {
             OperationNameRequired => write!(f, "Operation name required"),
             OperationNotFound(s) => {
                 write!(f, "Operation name not found `{}`", s)
+            }
+            ValidationError(_pos, message) => {
+                write!(f, "{}", message)
             }
             NotSupported(s) => write!(f, "Not supported: {}", s),
             NoRootSubscriptionObjectType => {
@@ -273,6 +280,7 @@ impl fmt::Display for QueryExecutionError {
             Panic(msg) => write!(f, "panic processing query: {}", msg),
             EventStreamError => write!(f, "error in the subscription event stream"),
             FulltextQueryRequiresFilter => write!(f, "fulltext search queries can only use EntityFilter::Equal"),
+            FulltextQueryInvalidSyntax(msg) => write!(f, "Invalid fulltext search query syntax. Error: {}. Hint: Search terms with spaces need to be enclosed in single quotes", msg),
             TooExpensive => write!(f, "query is too expensive"),
             Throttled => write!(f, "service is overloaded and can not run the query right now. Please try again in a few minutes"),
             DeploymentReverted => write!(f, "the chain was reorganized while executing the query"),

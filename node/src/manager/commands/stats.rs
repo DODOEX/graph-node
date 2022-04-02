@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::manager::deployment::DeploymentSearch;
 use diesel::r2d2::ConnectionManager;
 use diesel::r2d2::PooledConnection;
 use diesel::sql_query;
@@ -12,34 +14,22 @@ use graph_store_postgres::command_support::catalog::Site;
 use graph_store_postgres::command_support::{catalog as store_catalog, SqlName};
 use graph_store_postgres::connection_pool::ConnectionPool;
 use graph_store_postgres::Shard;
+use graph_store_postgres::SubgraphStore;
 use graph_store_postgres::PRIMARY_SHARD;
-
-fn parse_table_name(table: &str) -> Result<(&str, SqlName), anyhow::Error> {
-    let mut parts = table.split('.');
-    let nsp = parts
-        .next()
-        .ok_or_else(|| anyhow!("the table must be in the form 'sgdNNN.table'"))?;
-    let table = parts
-        .next()
-        .ok_or_else(|| anyhow!("the table must be in the form 'sgdNNN.table'"))?;
-    let table = SqlName::from(table);
-
-    if !parts.next().is_none() {
-        return Err(anyhow!("the table must be in the form 'sgdNNN.table'"));
-    }
-    Ok((nsp, table))
-}
 
 fn site_and_conn(
     pools: HashMap<Shard, ConnectionPool>,
-    nsp: &str,
+    search: &DeploymentSearch,
 ) -> Result<(Site, PooledConnection<ConnectionManager<PgConnection>>), anyhow::Error> {
-    let conn = pools.get(&*PRIMARY_SHARD).unwrap().get()?;
+    let primary_pool = pools.get(&*PRIMARY_SHARD).unwrap();
+    let locator = search.locate_unique(primary_pool)?;
+
+    let conn = primary_pool.get()?;
     let conn = store_catalog::Connection::new(conn);
 
     let site = conn
-        .find_site_by_name(nsp)?
-        .ok_or_else(|| anyhow!("deployment `{}` does not exist", nsp))?;
+        .locate_site(locator)?
+        .ok_or_else(|| anyhow!("deployment `{}` does not exist", search))?;
 
     let conn = pools.get(&site.shard).unwrap().get()?;
 
@@ -49,12 +39,13 @@ fn site_and_conn(
 pub fn account_like(
     pools: HashMap<Shard, ConnectionPool>,
     clear: bool,
+    search: &DeploymentSearch,
     table: String,
 ) -> Result<(), anyhow::Error> {
-    let (nsp, table_name) = parse_table_name(&table)?;
-    let (site, conn) = site_and_conn(pools, nsp)?;
+    let table = SqlName::from(table);
+    let (site, conn) = site_and_conn(pools, search)?;
 
-    store_catalog::set_account_like(&conn, &site, &table_name, !clear)?;
+    store_catalog::set_account_like(&conn, &site, &table, !clear)?;
     let clear_text = if clear { "cleared" } else { "set" };
     println!("{}: account-like flag {}", table, clear_text);
 
@@ -63,10 +54,10 @@ pub fn account_like(
 
 pub fn show(
     pools: HashMap<Shard, ConnectionPool>,
-    nsp: String,
+    search: &DeploymentSearch,
     table: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    let (site, conn) = site_and_conn(pools, &nsp)?;
+    let (site, conn) = site_and_conn(pools, search)?;
 
     #[derive(Queryable, QueryableByName)]
     struct VersionStats {
@@ -150,4 +141,18 @@ pub fn show(
     }
 
     Ok(())
+}
+
+pub async fn analyze(
+    store: Arc<SubgraphStore>,
+    pool: ConnectionPool,
+    search: DeploymentSearch,
+    entity_name: &str,
+) -> Result<(), anyhow::Error> {
+    let locator = search.locate_unique(&pool)?;
+    println!("Analyzing table sgd{}.{entity_name}", locator.id);
+    store
+        .analyze(&locator, entity_name)
+        .await
+        .map_err(|e| anyhow!(e))
 }

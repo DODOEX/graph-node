@@ -1,26 +1,15 @@
+use crate::gas_rules::GasRules;
 use crate::module::{ExperimentalFeatures, WasmInstance};
 use futures::sync::mpsc;
 use futures03::channel::oneshot::Sender;
 use graph::blockchain::{Blockchain, HostFn, TriggerWithHandler};
+use graph::components::store::SubgraphFork;
 use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
 use graph::prelude::*;
+use graph::runtime::gas::Gas;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
-
-const ONE_MIB: usize = 1 << 20; // 1_048_576
-
-lazy_static! {
-    /// Verbose logging of mapping inputs
-    pub static ref LOG_TRIGGER_DATA: bool = std::env::var("GRAPH_LOG_TRIGGER_DATA").is_ok();
-
-    /// Maximum stack size for the WASM runtime
-    pub static ref MAX_STACK_SIZE: usize = std::env::var("GRAPH_RUNTIME_MAX_STACK_SIZE")
-        .ok()
-        .and_then(|max_stack_size| max_stack_size.parse().ok())
-        // 512KiB
-        .unwrap_or(ONE_MIB / 2);
-}
 
 /// Spawn a wasm module in its own thread.
 pub fn spawn_module<C: Blockchain>(
@@ -58,25 +47,15 @@ pub fn spawn_module<C: Blockchain>(
                     trigger,
                     result_sender,
                 } = request;
-                let logger = ctx.logger.cheap_clone();
 
-                // Start the WASM module runtime.
-                let section = host_metrics.stopwatch.start_section("module_init");
-                let module = WasmInstance::from_valid_module_with_ctx(
+                let result = instantiate_module_and_handle_trigger(
                     valid_module.cheap_clone(),
                     ctx,
+                    trigger,
                     host_metrics.cheap_clone(),
                     timeout,
                     experimental_features,
-                )?;
-                section.end();
-
-                let section = host_metrics.stopwatch.start_section("run_handler");
-                if *LOG_TRIGGER_DATA {
-                    debug!(logger, "trigger data: {:?}", trigger);
-                }
-                let result = module.handle_trigger(trigger);
-                section.end();
+                );
 
                 result_sender
                     .send(result)
@@ -95,10 +74,38 @@ pub fn spawn_module<C: Blockchain>(
     Ok(mapping_request_sender)
 }
 
+fn instantiate_module_and_handle_trigger<C: Blockchain>(
+    valid_module: Arc<ValidModule>,
+    ctx: MappingContext<C>,
+    trigger: TriggerWithHandler<C>,
+    host_metrics: Arc<HostMetrics>,
+    timeout: Option<Duration>,
+    experimental_features: ExperimentalFeatures,
+) -> Result<(BlockState<C>, Gas), MappingError> {
+    let logger = ctx.logger.cheap_clone();
+
+    // Start the WASM module runtime.
+    let section = host_metrics.stopwatch.start_section("module_init");
+    let module = WasmInstance::from_valid_module_with_ctx(
+        valid_module,
+        ctx,
+        host_metrics.cheap_clone(),
+        timeout,
+        experimental_features,
+    )?;
+    section.end();
+
+    let _section = host_metrics.stopwatch.start_section("run_handler");
+    if ENV_VARS.log_trigger_data {
+        debug!(logger, "trigger data: {:?}", trigger);
+    }
+    module.handle_trigger(trigger)
+}
+
 pub struct MappingRequest<C: Blockchain> {
     pub(crate) ctx: MappingContext<C>,
     pub(crate) trigger: TriggerWithHandler<C>,
-    pub(crate) result_sender: Sender<Result<BlockState<C>, MappingError>>,
+    pub(crate) result_sender: Sender<Result<(BlockState<C>, Gas), MappingError>>,
 }
 
 pub struct MappingContext<C: Blockchain> {
@@ -108,6 +115,7 @@ pub struct MappingContext<C: Blockchain> {
     pub state: BlockState<C>,
     pub proof_of_indexing: SharedProofOfIndexing,
     pub host_fns: Arc<Vec<HostFn>>,
+    pub debug_fork: Option<Arc<dyn SubgraphFork>>,
 }
 
 impl<C: Blockchain> MappingContext<C> {
@@ -119,6 +127,7 @@ impl<C: Blockchain> MappingContext<C> {
             state: BlockState::new(self.state.entity_cache.store.clone(), Default::default()),
             proof_of_indexing: self.proof_of_indexing.cheap_clone(),
             host_fns: self.host_fns.cheap_clone(),
+            debug_fork: self.debug_fork.cheap_clone(),
         }
     }
 }
@@ -141,6 +150,14 @@ pub struct ValidModule {
 impl ValidModule {
     /// Pre-process and validate the module.
     pub fn new(raw_module: &[u8]) -> Result<Self, anyhow::Error> {
+        // Add the gas calls here. Module name "gas" must match. See also
+        // e3f03e62-40e4-4f8c-b4a1-d0375cca0b76. We do this by round-tripping the module through
+        // parity - injecting gas then serializing again.
+        let parity_module = parity_wasm::elements::Module::from_bytes(raw_module)?;
+        let parity_module = pwasm_utils::inject_gas_counter(parity_module, &GasRules, "gas")
+            .map_err(|_| anyhow!("Failed to inject gas counter"))?;
+        let raw_module = parity_module.to_bytes()?;
+
         // We currently use Cranelift as a compilation engine. Cranelift is an optimizing compiler,
         // but that should not cause determinism issues since it adheres to the Wasm spec. Still we
         // turn off optional optimizations to be conservative.
@@ -149,10 +166,12 @@ impl ValidModule {
         config.interruptable(true); // For timeouts.
         config.cranelift_nan_canonicalization(true); // For NaN determinism.
         config.cranelift_opt_level(wasmtime::OptLevel::None);
-        config.max_wasm_stack(*MAX_STACK_SIZE).unwrap(); // Safe because this only panics if size passed is 0.
+        config
+            .max_wasm_stack(ENV_VARS.mappings.max_stack_size)
+            .unwrap(); // Safe because this only panics if size passed is 0.
 
         let engine = &wasmtime::Engine::new(&config)?;
-        let module = wasmtime::Module::from_binary(&engine, raw_module)?;
+        let module = wasmtime::Module::from_binary(&engine, &raw_module)?;
 
         let mut import_name_to_modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
 

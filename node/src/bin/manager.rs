@@ -10,9 +10,14 @@ use structopt::StructOpt;
 
 use graph::{
     log::logger,
-    prelude::{info, o, slog, tokio, Logger, NodeId},
+    prelude::{info, o, slog, tokio, Logger, NodeId, ENV_VARS},
+    url::Url,
 };
-use graph_node::{manager::PanicSubscriptionManager, store_builder::StoreBuilder};
+use graph_node::{
+    manager::{deployment::DeploymentSearch, PanicSubscriptionManager},
+    store_builder::StoreBuilder,
+    MetricsContext,
+};
 use graph_store_postgres::{
     connection_pool::ConnectionPool, BlockStore, Shard, Store, SubgraphStore, SubscriptionManager,
     PRIMARY_SHARD,
@@ -20,6 +25,8 @@ use graph_store_postgres::{
 
 use graph_node::config::{self, Config as Cfg};
 use graph_node::manager::commands;
+
+const VERSION_LABEL_KEY: &str = "version";
 
 git_testament!(TESTAMENT);
 
@@ -55,15 +62,27 @@ pub struct Opt {
         default_value = "default",
         value_name = "NODE_ID",
         env = "GRAPH_NODE_ID",
-        help = "a unique identifier for this node\n"
+        help = "a unique identifier for this node.\nShould have the same value between consecutive node restarts\n"
     )]
     pub node_id: String,
+    #[structopt(
+        long,
+        value_name = "{HOST:PORT|URL}",
+        default_value = "https://api.thegraph.com/ipfs/",
+        env = "IPFS",
+        help = "HTTP addresses of IPFS nodes"
+    )]
+    pub ipfs: Vec<String>,
     #[structopt(
         long,
         default_value = "3",
         help = "the size for connection pools. Set to 0\n to use pool size from configuration file\n corresponding to NODE_ID"
     )]
     pub pool_size: u32,
+    #[structopt(long, value_name = "URL", help = "Base URL for forking subgraphs")]
+    pub fork_base: Option<String>,
+    #[structopt(long, help = "version label, used for prometheus metrics")]
+    pub version_label: Option<String>,
     #[structopt(subcommand)]
     pub cmd: Command,
 }
@@ -76,9 +95,14 @@ pub enum Command {
         delay: u64,
     },
     /// Print details about a deployment
+    ///
+    /// The deployment can be specified as either a subgraph name, an IPFS
+    /// hash `Qm..`, or the database namespace `sgdNNN`. Since the same IPFS
+    /// hash can be deployed in multiple shards, it is possible to specify
+    /// the shard by adding `:shard` to the IPFS hash.
     Info {
-        /// The deployment, an id, schema name or subgraph name
-        name: String,
+        /// The deployment (see above)
+        deployment: DeploymentSearch,
         /// List only current version
         #[structopt(long, short)]
         current: bool,
@@ -109,19 +133,15 @@ pub enum Command {
     },
     /// Assign or reassign a deployment
     Reassign {
-        /// The id of the deployment to reassign
-        id: String,
+        /// The deployment (see `help info`)
+        deployment: DeploymentSearch,
         /// The name of the node that should index the deployment
         node: String,
-        /// The shard of the deployment if `id` itself is ambiguous
-        shard: Option<String>,
     },
     /// Unassign a deployment
     Unassign {
-        /// The id of the deployment to unassign
-        id: String,
-        /// The shard of the deployment if `id` itself is ambiguous
-        shard: Option<String>,
+        /// The deployment (see `help info`)
+        deployment: DeploymentSearch,
     },
     /// Rewind a subgraph to a specific block
     Rewind {
@@ -141,8 +161,24 @@ pub enum Command {
         block_hash: String,
         /// The block number of the target block
         block_number: i32,
-        /// The deployments to rewind
-        names: Vec<String>,
+        /// The deployments to rewind (see `help info`)
+        deployments: Vec<DeploymentSearch>,
+    },
+    /// Deploy and run an arbitrary subgraph up to a certain block, although it can surpass it by a few blocks, it's not exact (use for dev and testing purposes) -- WARNING: WILL RUN MIGRATIONS ON THE DB, DO NOT USE IN PRODUCTION
+    ///
+    /// Also worth noting that the deployed subgraph will be removed at the end.
+    Run {
+        /// Network name (must fit one of the chain)
+        network_name: String,
+
+        /// Subgraph in the form `<IPFS Hash>` or `<name>:<IPFS Hash>`
+        subgraph: String,
+
+        /// Highest block number to process before stopping (inclusive)
+        stop_block: i32,
+
+        /// Prometheus push gateway endpoint.
+        prometheus_host: Option<String>,
     },
     /// Check and interrogate the configuration
     ///
@@ -168,6 +204,9 @@ pub enum Command {
     Chain(ChainCommand),
     /// Manipulate internal subgraph statistics
     Stats(StatsCommand),
+
+    /// Manage database indexes
+    Index(IndexCommand),
 }
 
 impl Command {
@@ -237,8 +276,8 @@ pub enum ListenCommand {
     Assignments,
     /// Listen to events for entities in a specific deployment
     Entities {
-        /// The deployment hash
-        deployment: String,
+        /// The deployment (see `help info`).
+        deployment: DeploymentSearch,
         /// The entity types for which to print change notifications
         entity_types: Vec<String>,
     },
@@ -257,14 +296,12 @@ pub enum CopyCommand {
         /// How far behind `src` subgraph head to copy
         #[structopt(long, short, default_value = "200")]
         offset: u32,
-        /// The IPFS hash of the source deployment
-        src: String,
+        /// The source deployment (see `help info`)
+        src: DeploymentSearch,
         /// The name of the database shard into which to copy
         shard: String,
         /// The name of the node that should index the copy
         node: String,
-        /// The shard of the `src` subgraph in case that is ambiguous
-        src_shard: Option<String>,
     },
     /// Activate the copy of a deployment.
     ///
@@ -281,8 +318,8 @@ pub enum CopyCommand {
     List,
     /// Print the progress of a copy operation
     Status {
-        /// The internal id of the destination of the copy operation (number)
-        dst: i32,
+        /// The destination deployment of the copy operation (see `help info`)
+        dst: DeploymentSearch,
     },
 }
 
@@ -320,8 +357,11 @@ pub enum StatsCommand {
     /// to distinct entities. It can take up to 5 minutes for this to take
     /// effect.
     AccountLike {
-        #[structopt(long, help = "do not set but clear the account-like flag\n")]
+        #[structopt(long, short, help = "do not set but clear the account-like flag\n")]
         clear: bool,
+        /// The deployment (see `help info`).
+        deployment: DeploymentSearch,
+        /// The name of the database table
         table: String,
     },
     /// Show statistics for the tables of a deployment
@@ -333,10 +373,75 @@ pub enum StatsCommand {
     /// in that table, which can be very slow, but is needed since the
     /// statistics based data can be off by an order of magnitude.
     Show {
-        /// The namespace of the deployment in the form `sgdNNNN`
-        nsp: String,
+        /// The deployment (see `help info`).
+        deployment: DeploymentSearch,
         /// The name of a table to fully count
         table: Option<String>,
+    },
+    /// Perform a SQL ANALYZE in a Entity table
+    Analyze {
+        /// The deployment (see `help info`).
+        deployment: DeploymentSearch,
+        /// The name of the Entity to ANALYZE, in camel case
+        entity: String,
+    },
+}
+
+#[derive(Clone, Debug, StructOpt)]
+pub enum IndexCommand {
+    /// Creates a new database index.
+    ///
+    /// The new index will be created concurrenly for the provided entity and its fields. whose
+    /// names must be declared the in camel case, following GraphQL conventions.
+    ///
+    /// The index will have its validity checked after the operation and will be dropped if it is
+    /// invalid.
+    ///
+    /// This command may be time-consuming.
+    Create {
+        /// The deployment (see `help info`).
+        #[structopt(empty_values = false)]
+        deployment: DeploymentSearch,
+        /// The Entity name.
+        ///
+        /// Can be expressed either in upper camel case (as its GraphQL definition) or in snake case
+        /// (as its SQL table name).
+        #[structopt(empty_values = false)]
+        entity: String,
+        /// The Field names.
+        ///
+        /// Each field can be expressed either in camel case (as its GraphQL definition) or in snake
+        /// case (as its SQL colmun name).
+        #[structopt(min_values = 1, required = true)]
+        fields: Vec<String>,
+        /// The index method. Defaults to `btree`.
+        #[structopt(
+            short, long, default_value = "btree",
+            possible_values = &["btree", "hash", "gist", "spgist", "gin", "brin"]
+        )]
+        method: String,
+    },
+    /// Lists existing indexes for a given Entity
+    List {
+        /// The deployment (see `help info`).
+        #[structopt(empty_values = false)]
+        deployment: DeploymentSearch,
+        /// The Entity name.
+        ///
+        /// Can be expressed either in upper camel case (as its GraphQL definition) or in snake case
+        /// (as its SQL table name).
+        #[structopt(empty_values = false)]
+        entity: String,
+    },
+
+    /// Drops an index for a given deployment, concurrently
+    Drop {
+        /// The deployment (see `help info`).
+        #[structopt(empty_values = false)]
+        deployment: DeploymentSearch,
+        /// The name of the index to be dropped
+        #[structopt(empty_values = false)]
+        index_name: String,
     },
 }
 
@@ -355,12 +460,32 @@ struct Context {
     logger: Logger,
     node_id: NodeId,
     config: Cfg,
+    ipfs_url: Vec<String>,
+    fork_base: Option<Url>,
     registry: Arc<MetricsRegistry>,
+    pub prometheus_registry: Arc<Registry>,
 }
 
 impl Context {
-    fn new(logger: Logger, node_id: NodeId, config: Cfg) -> Self {
-        let prometheus_registry = Arc::new(Registry::new());
+    fn new(
+        logger: Logger,
+        node_id: NodeId,
+        config: Cfg,
+        ipfs_url: Vec<String>,
+        fork_base: Option<Url>,
+        version_label: Option<String>,
+    ) -> Self {
+        let prometheus_registry = Arc::new(
+            Registry::new_custom(
+                None,
+                version_label.map(|label| {
+                    let mut m = HashMap::<String, String>::new();
+                    m.insert(VERSION_LABEL_KEY.into(), label);
+                    m
+                }),
+            )
+            .expect("unable to build prometheus registry"),
+        );
         let registry = Arc::new(MetricsRegistry::new(
             logger.clone(),
             prometheus_registry.clone(),
@@ -370,8 +495,23 @@ impl Context {
             logger,
             node_id,
             config,
+            ipfs_url,
+            fork_base,
             registry,
+            prometheus_registry,
         }
+    }
+
+    fn metrics_registry(&self) -> Arc<MetricsRegistry> {
+        self.registry.clone()
+    }
+
+    fn config(&self) -> Cfg {
+        self.config.clone()
+    }
+
+    fn node_id(&self) -> NodeId {
+        self.node_id.clone()
     }
 
     fn primary_pool(self) -> ConnectionPool {
@@ -392,13 +532,21 @@ impl Context {
         self.store_and_pools().0.subgraph_store()
     }
 
-    fn subscription_manager(self) -> Arc<SubscriptionManager> {
+    fn subscription_manager(&self) -> Arc<SubscriptionManager> {
         let primary = self.config.primary_store();
+
         Arc::new(SubscriptionManager::new(
             self.logger.clone(),
             primary.connection.to_owned(),
             self.registry.clone(),
         ))
+    }
+
+    fn primary_and_subscription_manager(self) -> (ConnectionPool, Arc<SubscriptionManager>) {
+        let mgr = self.subscription_manager();
+        let primary_pool = self.primary_pool();
+
+        (primary_pool, mgr)
     }
 
     fn store(self) -> Arc<Store> {
@@ -411,11 +559,23 @@ impl Context {
         pools
     }
 
+    async fn store_builder(&self) -> StoreBuilder {
+        StoreBuilder::new(
+            &self.logger,
+            &self.node_id,
+            &self.config,
+            self.fork_base.clone(),
+            self.registry.clone(),
+        )
+        .await
+    }
+
     fn store_and_pools(self) -> (Arc<Store>, HashMap<Shard, ConnectionPool>) {
         let (subgraph_store, pools) = StoreBuilder::make_subgraph_store_and_pools(
             &self.logger,
             &self.node_id,
             &self.config,
+            self.fork_base,
             self.registry,
         );
 
@@ -470,8 +630,9 @@ impl Context {
 async fn main() {
     let opt = Opt::from_args();
 
+    let version_label = opt.version_label.clone();
     // Set up logger
-    let logger = match env::var_os("GRAPH_LOG") {
+    let logger = match ENV_VARS.log_levels {
         Some(_) => logger(false),
         None => Logger::root(slog::Discard, o!()),
     };
@@ -507,13 +668,43 @@ async fn main() {
         }
         Ok(node) => node,
     };
-    let ctx = Context::new(logger.clone(), node, config);
+
+    let fork_base = match &opt.fork_base {
+        Some(url) => {
+            // Make sure the endpoint ends with a terminating slash.
+            let url = if !url.ends_with("/") {
+                let mut url = url.clone();
+                url.push('/');
+                Url::parse(&url)
+            } else {
+                Url::parse(url)
+            };
+
+            match url {
+                Err(e) => {
+                    eprintln!("invalid fork base URL: {}", e);
+                    std::process::exit(1);
+                }
+                Ok(url) => Some(url),
+            }
+        }
+        None => None,
+    };
+
+    let ctx = Context::new(
+        logger.clone(),
+        node,
+        config,
+        opt.ipfs,
+        fork_base,
+        version_label.clone(),
+    );
 
     use Command::*;
     let result = match opt.cmd {
         TxnSpeed { delay } => commands::txn_speed::run(ctx.primary_pool(), delay),
         Info {
-            name,
+            deployment,
             current,
             pending,
             status,
@@ -525,7 +716,7 @@ async fn main() {
             } else {
                 (ctx.primary_pool(), None)
             };
-            commands::info::run(primary, store, name, current, pending, used)
+            commands::info::run(primary, store, deployment, current, pending, used)
         }
         Unused(cmd) => {
             let store = ctx.subgraph_store();
@@ -558,29 +749,62 @@ async fn main() {
         }
         Remove { name } => commands::remove::run(ctx.subgraph_store(), name),
         Create { name } => commands::create::run(ctx.subgraph_store(), name),
-        Unassign { id, shard } => {
-            commands::assign::unassign(logger.clone(), ctx.subgraph_store(), id, shard).await
+        Unassign { deployment } => {
+            commands::assign::unassign(ctx.primary_pool(), &deployment).await
         }
-        Reassign { id, node, shard } => {
-            commands::assign::reassign(ctx.subgraph_store(), id, node, shard)
+        Reassign { deployment, node } => {
+            commands::assign::reassign(ctx.primary_pool(), &deployment, node)
         }
         Rewind {
             force,
             sleep,
             block_hash,
             block_number,
-            names,
+            deployments,
         } => {
             let (store, primary) = ctx.store_and_primary();
             commands::rewind::run(
                 primary,
                 store,
-                names,
+                deployments,
                 block_hash,
                 block_number,
                 force,
                 sleep,
             )
+        }
+        Run {
+            network_name,
+            subgraph,
+            stop_block,
+            prometheus_host,
+        } => {
+            let logger = ctx.logger.clone();
+            let config = ctx.config();
+            let registry = ctx.metrics_registry().clone();
+            let node_id = ctx.node_id().clone();
+            let store_builder = ctx.store_builder().await;
+            let job_name = version_label.clone();
+            let ipfs_url = ctx.ipfs_url.clone();
+            let metrics_ctx = MetricsContext {
+                prometheus: ctx.prometheus_registry.clone(),
+                registry: registry.clone(),
+                prometheus_host,
+                job_name,
+            };
+
+            commands::run::run(
+                logger,
+                store_builder,
+                network_name,
+                ipfs_url,
+                config,
+                metrics_ctx,
+                node_id,
+                subgraph,
+                stop_block,
+            )
+            .await
         }
         Listen(cmd) => {
             use ListenCommand::*;
@@ -590,8 +814,8 @@ async fn main() {
                     deployment,
                     entity_types,
                 } => {
-                    commands::listen::entities(ctx.subscription_manager(), deployment, entity_types)
-                        .await
+                    let (primary, mgr) = ctx.primary_and_subscription_manager();
+                    commands::listen::entities(primary, mgr, &deployment, entity_types).await
                 }
             }
         }
@@ -603,13 +827,15 @@ async fn main() {
                     shard,
                     node,
                     offset,
-                    src_shard,
-                } => commands::copy::create(ctx.store(), src, src_shard, shard, node, offset).await,
+                } => {
+                    let (store, primary) = ctx.store_and_primary();
+                    commands::copy::create(store, primary, src, shard, node, offset).await
+                }
                 Activate { deployment, shard } => {
                     commands::copy::activate(ctx.subgraph_store(), deployment, shard)
                 }
                 List => commands::copy::list(ctx.pools()),
-                Status { dst } => commands::copy::status(ctx.pools(), dst),
+                Status { dst } => commands::copy::status(ctx.pools(), &dst),
             }
         }
         Query {
@@ -622,7 +848,7 @@ async fn main() {
             match cmd {
                 List => {
                     let (block_store, primary) = ctx.block_store_and_primary_pool();
-                    commands::chain::list(primary, block_store)
+                    commands::chain::list(primary, block_store).await
                 }
                 Info {
                     name,
@@ -630,7 +856,7 @@ async fn main() {
                     hashes,
                 } => {
                     let (block_store, primary) = ctx.block_store_and_primary_pool();
-                    commands::chain::info(primary, block_store, name, reorg_threshold, hashes)
+                    commands::chain::info(primary, block_store, name, reorg_threshold, hashes).await
                 }
                 Remove { name } => {
                     let (block_store, primary) = ctx.block_store_and_primary_pool();
@@ -641,10 +867,53 @@ async fn main() {
         Stats(cmd) => {
             use StatsCommand::*;
             match cmd {
-                AccountLike { clear, table } => {
-                    commands::stats::account_like(ctx.pools(), clear, table)
+                AccountLike {
+                    clear,
+                    deployment,
+                    table,
+                } => commands::stats::account_like(ctx.pools(), clear, &deployment, table),
+                Show { deployment, table } => {
+                    commands::stats::show(ctx.pools(), &deployment, table)
                 }
-                Show { nsp, table } => commands::stats::show(ctx.pools(), nsp, table),
+                Analyze { deployment, entity } => {
+                    let (store, primary_pool) = ctx.store_and_primary();
+                    let subgraph_store = store.subgraph_store();
+                    commands::stats::analyze(subgraph_store, primary_pool, deployment, &entity)
+                        .await
+                }
+            }
+        }
+        Index(cmd) => {
+            use IndexCommand::*;
+            let (store, primary_pool) = ctx.store_and_primary();
+            let subgraph_store = store.subgraph_store();
+            match cmd {
+                Create {
+                    deployment,
+                    entity,
+                    fields,
+                    method,
+                } => {
+                    commands::index::create(
+                        subgraph_store,
+                        primary_pool,
+                        deployment,
+                        &entity,
+                        fields,
+                        method,
+                    )
+                    .await
+                }
+                List { deployment, entity } => {
+                    commands::index::list(subgraph_store, primary_pool, deployment, &entity).await
+                }
+                Drop {
+                    deployment,
+                    index_name,
+                } => {
+                    commands::index::drop(subgraph_store, primary_pool, deployment, &index_name)
+                        .await
+                }
             }
         }
     };

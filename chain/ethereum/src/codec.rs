@@ -1,12 +1,16 @@
-#[path = "protobuf/dfuse.ethereum.codec.v1.rs"]
+#[path = "protobuf/sf.ethereum.codec.v1.rs"]
 mod pbcodec;
 
-use graph::prelude::{
-    web3,
-    web3::types::TransactionReceipt as w3TransactionReceipt,
-    web3::types::{Bytes, H160, H2048, H256, H64, U256, U64},
-    EthereumBlock, EthereumBlockWithCalls, EthereumCall, LightEthereumBlock,
+use graph::{
+    blockchain::{Block as BlockchainBlock, BlockPtr},
+    prelude::{
+        web3,
+        web3::types::TransactionReceipt as w3TransactionReceipt,
+        web3::types::{Bytes, H160, H2048, H256, H64, U256, U64},
+        BlockNumber, EthereumBlock, EthereumBlockWithCalls, EthereumCall, LightEthereumBlock,
+    },
 };
+use std::convert::TryFrom;
 use std::sync::Arc;
 
 use crate::chain::BlockFinality;
@@ -130,7 +134,9 @@ impl Into<web3::types::U64> for TransactionTraceStatus {
 impl Into<Option<web3::types::U64>> for TransactionTraceStatus {
     fn into(self) -> Option<web3::types::U64> {
         match self {
-            Self::Unknown => None,
+            Self::Unknown => {
+                panic!("Got a transaction trace with status UNKNOWN, datasource is broken")
+            }
             Self::Succeeded => Some(web3::types::U64::from(1)),
             Self::Failed => Some(web3::types::U64::from(0)),
             Self::Reverted => Some(web3::types::U64::from(0)),
@@ -159,22 +165,18 @@ impl<'a> Into<web3::types::Transaction> for TransactionTraceAt<'a> {
             transaction_index: Some(U64::from(self.trace.index as u64)),
             from: Some(H160::from_slice(&self.trace.from)),
             to: Some(H160::from_slice(&self.trace.to)),
-            value: self
-                .trace
-                .value
-                .as_ref()
-                .map_or_else(|| U256::from(0), |x| x.into()),
-            gas_price: self
-                .trace
-                .gas_price
-                .as_ref()
-                .map_or_else(|| U256::from(0), |x| x.into()),
+            value: self.trace.value.as_ref().map_or(U256::zero(), |x| x.into()),
+            gas_price: self.trace.gas_price.as_ref().map(|x| x.into()),
             gas: U256::from(self.trace.gas_used),
             input: Bytes::from(self.trace.input.clone()),
             v: None,
             r: None,
             s: None,
             raw: None,
+            access_list: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            transaction_type: None,
         }
     }
 }
@@ -276,10 +278,16 @@ impl Into<EthereumBlockWithCalls> for &Block {
                                 _ => Some(H256::from_slice(&r.state_root)),
                             },
                             logs_bloom: H2048::from_slice(&r.logs_bloom),
+                            from: H160::from_slice(&t.from),
+                            to: Some(H160::from_slice(&t.to)),
+                            transaction_type: None,
+                            effective_gas_price: None,
                         })
                     })
                     .collect(),
             },
+            // Comment (437a9f17-67cc-478f-80a3-804fe554b227): This Some() will avoid calls in the triggers_in_block
+            // TODO: Refactor in a way that this is no longer needed.
             calls: Some(
                 self.transaction_traces
                     .iter()
@@ -293,5 +301,83 @@ impl Into<EthereumBlockWithCalls> for &Block {
                     .collect(),
             ),
         }
+    }
+}
+
+impl BlockHeader {
+    pub fn parent_ptr(&self) -> Option<BlockPtr> {
+        match self.parent_hash.len() {
+            0 => None,
+            _ => Some(BlockPtr::from((
+                H256::from_slice(self.parent_hash.as_ref()),
+                self.number - 1,
+            ))),
+        }
+    }
+}
+
+impl<'a> From<&'a BlockHeader> for BlockPtr {
+    fn from(b: &'a BlockHeader) -> BlockPtr {
+        BlockPtr::from((H256::from_slice(b.hash.as_ref()), b.number))
+    }
+}
+
+impl<'a> From<&'a Block> for BlockPtr {
+    fn from(b: &'a Block) -> BlockPtr {
+        BlockPtr::from((H256::from_slice(b.hash.as_ref()), b.number))
+    }
+}
+
+impl Block {
+    pub fn header(&self) -> &BlockHeader {
+        self.header.as_ref().unwrap()
+    }
+
+    pub fn ptr(&self) -> BlockPtr {
+        BlockPtr::from(self.header())
+    }
+
+    pub fn parent_ptr(&self) -> Option<BlockPtr> {
+        self.header().parent_ptr()
+    }
+}
+
+impl BlockchainBlock for Block {
+    fn number(&self) -> i32 {
+        BlockNumber::try_from(self.header().number).unwrap()
+    }
+
+    fn ptr(&self) -> BlockPtr {
+        self.into()
+    }
+
+    fn parent_ptr(&self) -> Option<BlockPtr> {
+        self.parent_ptr()
+    }
+}
+
+impl HeaderOnlyBlock {
+    pub fn header(&self) -> &BlockHeader {
+        self.header.as_ref().unwrap()
+    }
+}
+
+impl<'a> From<&'a HeaderOnlyBlock> for BlockPtr {
+    fn from(b: &'a HeaderOnlyBlock) -> BlockPtr {
+        BlockPtr::from(b.header())
+    }
+}
+
+impl BlockchainBlock for HeaderOnlyBlock {
+    fn number(&self) -> i32 {
+        BlockNumber::try_from(self.header().number).unwrap()
+    }
+
+    fn ptr(&self) -> BlockPtr {
+        self.into()
+    }
+
+    fn parent_ptr(&self) -> Option<BlockPtr> {
+        self.header().parent_ptr()
     }
 }

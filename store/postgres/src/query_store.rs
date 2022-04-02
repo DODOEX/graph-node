@@ -54,8 +54,8 @@ impl QueryStoreTrait for QueryStore {
             .await?)
     }
 
-    fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError> {
-        self.store.block_ptr(&self.site)
+    async fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError> {
+        self.store.block_ptr(self.site.cheap_clone()).await
     }
 
     fn block_number(&self, block_hash: H256) -> Result<Option<BlockNumber>, StoreError> {
@@ -69,9 +69,8 @@ impl QueryStoreTrait for QueryStore {
         self.chain_store
             .block_number(block_hash)?
             .map(|(network_name, number)| {
-                if &network_name == subgraph_network {
-                    BlockNumber::try_from(number)
-                        .map_err(|e| StoreError::QueryExecutionError(e.to_string()))
+                if network_name == subgraph_network {
+                    Ok(number)
                 } else {
                     Err(StoreError::QueryExecutionError(format!(
                         "subgraph {} belongs to network {} but block {:x} belongs to network {}",

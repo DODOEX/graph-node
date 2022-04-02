@@ -118,6 +118,17 @@ impl fmt::Debug for BlockPtr {
     }
 }
 
+impl slog::Value for BlockPtr {
+    fn serialize(
+        &self,
+        record: &slog::Record,
+        key: slog::Key,
+        serializer: &mut dyn slog::Serializer,
+    ) -> slog::Result {
+        slog::Value::serialize(&self.to_string(), record, key, serializer)
+    }
+}
+
 impl<T> From<Block<T>> for BlockPtr {
     fn from(b: Block<T>) -> BlockPtr {
         BlockPtr::from((b.hash.unwrap(), b.number.unwrap().as_u64()))
@@ -143,6 +154,16 @@ impl From<(H256, i32)> for BlockPtr {
     fn from((hash, number): (H256, i32)) -> BlockPtr {
         BlockPtr {
             hash: hash.into(),
+            number,
+        }
+    }
+}
+
+impl From<(Vec<u8>, u64)> for BlockPtr {
+    fn from((bytes, number): (Vec<u8>, u64)) -> Self {
+        let number = i32::try_from(number).unwrap();
+        BlockPtr {
+            hash: BlockHash::from(bytes),
             number,
         }
     }
@@ -186,7 +207,10 @@ impl TryFrom<(&[u8], i64)> for BlockPtr {
             H256::from_slice(bytes)
         } else {
             return Err(anyhow!(
-                "invalid H256 value `{}` has {} bytes instead of {}"
+                "invalid H256 value `{}` has {} bytes instead of {}",
+                hex::encode(bytes),
+                bytes.len(),
+                H256::len_bytes()
             ));
         };
         Ok(BlockPtr::from((hash, number)))

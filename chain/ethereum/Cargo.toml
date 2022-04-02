@@ -1,17 +1,16 @@
 [package]
 name = "graph-chain-ethereum"
-version = "0.25.0"
-edition = "2018"
+version = "0.25.2"
+edition = "2021"
 
 [dependencies]
-chrono = "0.4"
+envconfig = "0.10.0"
 futures = "0.1.21"
 http = "0.2.4"
-jsonrpc-core = "17.0.0"
+jsonrpc-core = "18.0.0"
 graph = { path = "../../graph" }
 lazy_static = "1.2.0"
 mockall = "0.9.1"
-state_machine_future = "0.2"
 serde = "1.0"
 prost = "0.8"
 prost-types = "0.8"
@@ -19,7 +18,7 @@ dirs-next = "2.0"
 anyhow = "1.0"
 tiny-keccak = "1.5.0"
 hex = "0.4.3"
-semver = "1.0.3"
+semver = "1.0.7"
 
 itertools = "0.10.3"
 
@@ -27,11 +26,9 @@ graph-runtime-wasm = { path = "../../runtime/wasm" }
 graph-runtime-derive = { path = "../../runtime/derive" }
 
 [dev-dependencies]
-diesel = { version = "1.4.8", features = ["postgres", "serde_json", "numeric", "r2d2"] }
 graph-core = { path = "../../core" }
-graph-store-postgres = { path = "../../store/postgres" }
-pretty_assertions = "1.0.0"
 test-store = { path = "../../store/test-store" }
+base64 = "0.13.0"
 
 [build-dependencies]
 tonic-build = "0.5.1"

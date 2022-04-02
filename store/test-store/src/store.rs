@@ -2,7 +2,7 @@ use diesel::{self, PgConnection};
 use graph::data::graphql::effort::LoadManager;
 use graph::data::query::QueryResults;
 use graph::data::query::QueryTarget;
-use graph::data::subgraph::schema::SubgraphError;
+use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError};
 use graph::log;
 use graph::prelude::{QueryStoreManager as _, SubgraphStore as _, *};
 use graph::semver::Version;
@@ -21,14 +21,14 @@ use graph_node::store_builder::StoreBuilder;
 use graph_store_postgres::layout_for_tests::FAKE_NETWORK_SHARED;
 use graph_store_postgres::{connection_pool::ConnectionPool, Shard, SubscriptionManager};
 use graph_store_postgres::{
-    BlockStore as DieselBlcokStore, DeploymentPlacer, SubgraphStore as DieselSubgraphStore,
+    BlockStore as DieselBlockStore, DeploymentPlacer, SubgraphStore as DieselSubgraphStore,
     PRIMARY_SHARD,
 };
 use hex_literal::hex;
 use lazy_static::lazy_static;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::time::Instant;
-use std::{collections::BTreeSet, env};
 use std::{marker::PhantomData, sync::Mutex};
 use tokio::runtime::{Builder, Runtime};
 use web3::types::H256;
@@ -41,7 +41,7 @@ pub use graph_store_postgres::Store;
 const CONN_POOL_SIZE: u32 = 20;
 
 lazy_static! {
-    pub static ref LOGGER: Logger = match env::var_os("GRAPH_LOG") {
+    pub static ref LOGGER: Logger = match ENV_VARS.log_levels {
         Some(_) => log::logger(false),
         None => Logger::root(slog::Discard, o!()),
     };
@@ -63,7 +63,7 @@ lazy_static! {
     pub static ref SUBSCRIPTION_MANAGER: Arc<SubscriptionManager> = STORE_POOL_CONFIG.3.clone();
     pub static ref NODE_ID: NodeId = NodeId::new("test").unwrap();
     static ref SUBGRAPH_STORE: Arc<DieselSubgraphStore> = STORE.subgraph_store();
-    static ref BLOCK_STORE: Arc<DieselBlcokStore> = STORE.block_store();
+    static ref BLOCK_STORE: Arc<DieselBlockStore> = STORE.block_store();
     pub static ref GENESIS_PTR: BlockPtr = (
         H256::from(hex!(
             "bd34884280958002c51d3f7b5f853e6febeba33de0f40d15b0363006533c924f"
@@ -146,7 +146,7 @@ pub fn place(name: &str) -> Result<Option<(Vec<Shard>, Vec<NodeId>)>, String> {
     CONFIG.deployment.place(name, NETWORK_NAME)
 }
 
-pub fn create_subgraph(
+pub async fn create_subgraph(
     subgraph_id: &DeploymentHash,
     schema: &str,
     base: Option<(DeploymentHash, BlockPtr)>,
@@ -166,7 +166,7 @@ pub fn create_subgraph(
         chain: PhantomData,
     };
 
-    let deployment = SubgraphDeploymentEntity::new(&manifest, false, None).graft(base);
+    let deployment = DeploymentCreate::new(&manifest, None).graft(base);
     let name = {
         let mut name = subgraph_id.to_string();
         name.truncate(32);
@@ -180,17 +180,18 @@ pub fn create_subgraph(
         NETWORK_NAME.to_string(),
         SubgraphVersionSwitchingMode::Instant,
     )?;
-    futures03::executor::block_on(
-        SUBGRAPH_STORE
-            .cheap_clone()
-            .writable(LOGGER.clone(), deployment.id),
-    )?
-    .start_subgraph_deployment(&*LOGGER)?;
+
+    SUBGRAPH_STORE
+        .cheap_clone()
+        .writable(LOGGER.clone(), deployment.id)
+        .await?
+        .start_subgraph_deployment(&*LOGGER)
+        .await?;
     Ok(deployment)
 }
 
-pub fn create_test_subgraph(subgraph_id: &DeploymentHash, schema: &str) -> DeploymentLocator {
-    create_subgraph(subgraph_id, schema, None).unwrap()
+pub async fn create_test_subgraph(subgraph_id: &DeploymentHash, schema: &str) -> DeploymentLocator {
+    create_subgraph(subgraph_id, schema, None).await.unwrap()
 }
 
 pub fn remove_subgraph(id: &DeploymentHash) {
@@ -278,7 +279,7 @@ pub async fn revert_block(store: &Arc<Store>, deployment: &DeploymentLocator, pt
         .writable(LOGGER.clone(), deployment.id)
         .await
         .expect("can get writable")
-        .revert_block_operations(ptr.clone())
+        .revert_block_operations(ptr.clone(), None)
         .unwrap();
 }
 
@@ -488,7 +489,7 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
     let registry = Arc::new(MockMetricsRegistry::new());
     std::thread::spawn(move || {
         STORE_RUNTIME.handle().block_on(async {
-            let builder = StoreBuilder::new(&*LOGGER, &*NODE_ID, &config, registry).await;
+            let builder = StoreBuilder::new(&*LOGGER, &*NODE_ID, &config, None, registry).await;
             let subscription_manager = builder.subscription_manager();
             let primary_pool = builder.primary_pool();
 

@@ -3,27 +3,25 @@ use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, PooledConnection};
 use diesel::sql_types::Text;
 use diesel::{insert_into, update};
-use graph::blockchain::{Block, ChainIdentifier};
-use graph::prelude::web3::types::H256;
-use graph::{
-    constraint_violation,
-    prelude::{
-        async_trait, ethabi, CancelableError, ChainStore as ChainStoreTrait, EthereumCallCache,
-        StoreError,
-    },
-};
 
-use graph::ensure;
 use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
     iter::FromIterator,
     sync::Arc,
+    time::Duration,
 };
 
+use graph::blockchain::{Block, ChainIdentifier};
+use graph::cheap_clone::CheapClone;
+use graph::prelude::web3::types::H256;
 use graph::prelude::{
-    serde_json as json, transaction_receipt::LightTransactionReceipt, BlockNumber, BlockPtr, Error,
+    async_trait, ethabi, serde_json as json, transaction_receipt::LightTransactionReceipt,
+    BlockNumber, BlockPtr, CachedEthereumCall, CancelableError, ChainStore as ChainStoreTrait,
+    Error, EthereumCallCache, StoreError,
 };
+use graph::util::timed_cache::TimedCache;
+use graph::{constraint_violation, ensure};
 
 use crate::{
     block_store::ChainStatus, chain_head_listener::ChainHeadUpdateSender,
@@ -40,6 +38,7 @@ mod public {
             head_block_number -> Nullable<BigInt>,
             net_version -> Varchar,
             genesis_block_hash -> Varchar,
+            head_block_cursor -> Nullable<Varchar>,
         }
     }
 }
@@ -48,33 +47,26 @@ pub use data::Storage;
 
 /// Encapuslate access to the blocks table for a chain.
 mod data {
-
-    use diesel::sql_types::Binary;
-    use diesel::{connection::SimpleConnection, insert_into};
-    use diesel::{delete, prelude::*, sql_query};
-    use diesel::{dsl::sql, pg::PgConnection};
-    use diesel::{
-        pg::Pg,
-        serialize::Output,
-        sql_types::Text,
-        types::{FromSql, ToSql},
-    };
-    use diesel::{
-        sql_types::{BigInt, Bytea, Integer, Jsonb},
-        update,
-    };
+    use diesel::connection::SimpleConnection;
+    use diesel::dsl::sql;
+    use diesel::pg::{Pg, PgConnection};
+    use diesel::serialize::Output;
+    use diesel::sql_types::{BigInt, Binary, Bytea, Integer, Jsonb, Text};
+    use diesel::types::{FromSql, ToSql};
+    use diesel::{delete, insert_into, prelude::*, sql_query, update};
     use diesel_dynamic_schema as dds;
     use graph::blockchain::{Block, BlockHash};
-    use graph::{
-        constraint_violation,
-        prelude::{transaction_receipt::LightTransactionReceipt, StoreError},
+    use graph::constraint_violation;
+    use graph::prelude::ethabi::ethereum_types::H160;
+    use graph::prelude::transaction_receipt::LightTransactionReceipt;
+    use graph::prelude::web3::types::H256;
+    use graph::prelude::{
+        serde_json as json, BlockNumber, BlockPtr, CachedEthereumCall, Error, StoreError,
     };
 
     use std::fmt;
     use std::iter::FromIterator;
     use std::{convert::TryFrom, io::Write};
-
-    use graph::prelude::{serde_json as json, web3::types::H256, BlockNumber, BlockPtr, Error};
 
     use crate::transaction_receipt::RawTransactionReceipt;
 
@@ -235,6 +227,10 @@ mod data {
             self.table.column::<Bytea, _>("id")
         }
 
+        fn block_number(&self) -> DynColumn<BigInt> {
+            self.table.column::<BigInt, _>("block_number")
+        }
+
         fn return_value(&self) -> DynColumn<Bytea> {
             self.table.column::<Bytea, _>("return_value")
         }
@@ -344,6 +340,7 @@ mod data {
 	              contract_address bytea not null,
 	              block_number     int4 not null
                 );
+                create index call_cache_block_number_idx ON {nsp}.call_cache(block_number);
 
                 create table {nsp}.call_meta (
                     contract_address bytea not null primary key,
@@ -936,6 +933,46 @@ mod data {
             }
         }
 
+        pub(super) fn get_calls_in_block(
+            &self,
+            conn: &PgConnection,
+            block_ptr: BlockPtr,
+        ) -> Result<Vec<CachedEthereumCall>, Error> {
+            let block_num = block_ptr.block_number();
+
+            let rows = match self {
+                Storage::Shared => {
+                    use public::eth_call_cache as cache;
+
+                    cache::table
+                        .select((cache::id, cache::return_value, cache::contract_address))
+                        .filter(cache::block_number.eq(block_num))
+                        .order(cache::contract_address)
+                        .get_results::<(Vec<u8>, Vec<u8>, Vec<u8>)>(conn)?
+                }
+                Storage::Private(Schema { call_cache, .. }) => call_cache
+                    .table()
+                    .select((
+                        call_cache.id(),
+                        call_cache.return_value(),
+                        call_cache.contract_address(),
+                    ))
+                    .filter(call_cache.block_number().eq(block_num as i64))
+                    .order(call_cache.contract_address())
+                    .get_results::<(Vec<u8>, Vec<u8>, Vec<u8>)>(conn)?,
+            };
+
+            Ok(rows
+                .into_iter()
+                .map(|row| CachedEthereumCall {
+                    blake3_id: row.0,
+                    block_ptr: block_ptr.clone(),
+                    contract_address: H160::from_slice(&row.2[..]),
+                    return_value: row.1,
+                })
+                .collect())
+        }
+
         pub(super) fn update_accessed_at(
             &self,
             conn: &PgConnection,
@@ -1116,7 +1153,7 @@ mod data {
                 .unwrap();
         }
 
-        /// Queries the database for all the transaction receipts in a given block range.
+        /// Queries the database for all the transaction receipts in a given block.
         pub(crate) fn find_transaction_receipts_in_block(
             &self,
             conn: &PgConnection,
@@ -1175,6 +1212,7 @@ pub struct ChainStore {
     genesis_block_ptr: BlockPtr,
     status: ChainStatus,
     chain_head_update_sender: ChainHeadUpdateSender,
+    block_cache: TimedCache<&'static str, BlockPtr>,
 }
 
 impl ChainStore {
@@ -1186,16 +1224,15 @@ impl ChainStore {
         chain_head_update_sender: ChainHeadUpdateSender,
         pool: ConnectionPool,
     ) -> Self {
-        let store = ChainStore {
+        ChainStore {
             pool,
             chain,
             storage,
             genesis_block_ptr: BlockPtr::new(net_identifier.genesis_block_hash.clone(), 0),
             status,
             chain_head_update_sender,
-        };
-
-        store
+            block_cache: TimedCache::new(Duration::from_secs(5)),
+        }
     }
 
     pub fn is_ingestible(&self) -> bool {
@@ -1315,7 +1352,7 @@ impl ChainStoreTrait for ChainStore {
         pool.with_conn(move |conn, _| {
             conn.transaction(|| {
                 storage
-                    .upsert_block(&conn, &network, block.as_ref(), true)
+                    .upsert_block(conn, &network, block.as_ref(), true)
                     .map_err(CancelableError::from)
             })
         })
@@ -1344,7 +1381,7 @@ impl ChainStoreTrait for ChainStore {
                 .with_conn(move |conn, _| {
                     let candidate = chain_store
                         .storage
-                        .chain_head_candidate(&conn, &chain_store.chain)
+                        .chain_head_candidate(conn, &chain_store.chain)
                         .map_err(CancelableError::from)?;
                     let (ptr, first_block) = match &candidate {
                         None => return Ok((None, None)),
@@ -1354,7 +1391,7 @@ impl ChainStoreTrait for ChainStore {
                     match chain_store
                         .storage
                         .missing_parent(
-                            &conn,
+                            conn,
                             &chain_store.chain,
                             first_block as i64,
                             ptr.hash_as_h256(),
@@ -1393,23 +1430,95 @@ impl ChainStoreTrait for ChainStore {
         Ok(missing)
     }
 
-    fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error> {
+    async fn chain_head_ptr(self: Arc<Self>) -> Result<Option<BlockPtr>, Error> {
+        use public::ethereum_networks::dsl::*;
+
+        Ok(self
+            .cheap_clone()
+            .pool
+            .with_conn(move |conn, _| {
+                ethereum_networks
+                    .select((head_block_hash, head_block_number))
+                    .filter(name.eq(&self.chain))
+                    .load::<(Option<String>, Option<i64>)>(conn)
+                    .map(|rows| {
+                        rows.first()
+                            .map(|(hash_opt, number_opt)| match (hash_opt, number_opt) {
+                                (Some(hash), Some(number)) => {
+                                    Some((hash.parse().unwrap(), *number).into())
+                                }
+                                (None, None) => None,
+                                _ => unreachable!(),
+                            })
+                            .and_then(|opt: Option<BlockPtr>| opt)
+                            .map(|head| {
+                                self.block_cache.set("head", Arc::new(head.clone()));
+                                head
+                            })
+                    })
+                    .map_err(|e| CancelableError::from(StoreError::from(e)))
+            })
+            .await?)
+    }
+
+    async fn cached_head_ptr(self: Arc<Self>) -> Result<Option<BlockPtr>, Error> {
+        match self.block_cache.get("head") {
+            Some(head) => Ok(Some(head.as_ref().clone())),
+            None => self.chain_head_ptr().await,
+        }
+    }
+
+    fn chain_head_cursor(&self) -> Result<Option<String>, Error> {
         use public::ethereum_networks::dsl::*;
 
         ethereum_networks
-            .select((head_block_hash, head_block_number))
+            .select(head_block_cursor)
             .filter(name.eq(&self.chain))
-            .load::<(Option<String>, Option<i64>)>(&*self.get_conn()?)
+            .load::<Option<String>>(&*self.get_conn()?)
             .map(|rows| {
                 rows.first()
-                    .map(|(hash_opt, number_opt)| match (hash_opt, number_opt) {
-                        (Some(hash), Some(number)) => Some((hash.parse().unwrap(), *number).into()),
-                        (None, None) => None,
-                        _ => unreachable!(),
-                    })
+                    .map(|cursor_opt| cursor_opt.as_ref().cloned())
                     .and_then(|opt| opt)
             })
             .map_err(Error::from)
+    }
+
+    async fn set_chain_head(
+        self: Arc<Self>,
+        block: Arc<dyn Block>,
+        cursor: String,
+    ) -> Result<(), Error> {
+        use public::ethereum_networks as n;
+
+        let pool = self.pool.clone();
+        let network = self.chain.clone();
+        let storage = self.storage.clone();
+
+        let ptr = block.ptr();
+        let hash = ptr.hash_hex();
+        let number = ptr.number as i64;
+
+        pool.with_conn(move |conn, _| {
+            conn.transaction(|| -> Result<(), StoreError> {
+                storage
+                    .upsert_block(conn, &network, block.as_ref(), true)
+                    .map_err(CancelableError::from)?;
+
+                update(n::table.filter(n::name.eq(&self.chain)))
+                    .set((
+                        n::head_block_hash.eq(&hash),
+                        n::head_block_number.eq(number),
+                        n::head_block_cursor.eq(cursor),
+                    ))
+                    .execute(conn)?;
+
+                Ok(())
+            })
+            .map_err(CancelableError::from)
+        })
+        .await?;
+
+        Ok(())
     }
 
     fn blocks(&self, hashes: &[H256]) -> Result<Vec<json::Value>, Error> {
@@ -1417,8 +1526,8 @@ impl ChainStoreTrait for ChainStore {
         self.storage.blocks(&conn, &self.chain, hashes)
     }
 
-    fn ancestor_block(
-        &self,
+    async fn ancestor_block(
+        self: Arc<Self>,
         block_ptr: BlockPtr,
         offset: BlockNumber,
     ) -> Result<Option<json::Value>, Error> {
@@ -1429,8 +1538,15 @@ impl ChainStoreTrait for ChainStore {
             block_ptr.hash_hex()
         );
 
-        let conn = self.get_conn()?;
-        self.storage.ancestor_block(&conn, block_ptr, offset)
+        Ok(self
+            .cheap_clone()
+            .pool
+            .with_conn(move |conn, _| {
+                self.storage
+                    .ancestor_block(&conn, block_ptr, offset)
+                    .map_err(|e| CancelableError::from(StoreError::from(e)))
+            })
+            .await?)
     }
 
     fn cleanup_cached_blocks(
@@ -1478,8 +1594,6 @@ impl ChainStoreTrait for ChainStore {
                    and a.id = d.id
                    and not d.failed
                    and ds.network = $2) a;";
-        let ancestor_count = i32::try_from(ancestor_count)
-            .expect("ancestor_count fits into a signed 32 bit integer");
         diesel::sql_query(query)
             .bind::<Integer, _>(ancestor_count)
             .bind::<Text, _>(&self.chain)
@@ -1498,7 +1612,7 @@ impl ChainStoreTrait for ChainStore {
                 }
             })
             .unwrap_or(Ok(None))
-            .map_err(|e| e.into())
+            .map_err(Into::into)
     }
 
     fn block_hashes_by_block_number(&self, number: BlockNumber) -> Result<Vec<H256>, Error> {
@@ -1563,6 +1677,11 @@ impl EthereumCallCache for ChainStore {
         } else {
             Ok(None)
         }
+    }
+
+    fn get_calls_in_block(&self, block: BlockPtr) -> Result<Vec<CachedEthereumCall>, Error> {
+        let conn = &*self.get_conn()?;
+        conn.transaction::<_, Error, _>(|| Ok(self.storage.get_calls_in_block(conn, block)?))
     }
 
     fn set_call(

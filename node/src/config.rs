@@ -1,6 +1,6 @@
 use graph::{
     anyhow::Error,
-    blockchain::{block_ingestor::CLEANUP_BLOCKS, BlockchainKind},
+    blockchain::BlockchainKind,
     prelude::{
         anyhow::{anyhow, bail, Context, Result},
         info,
@@ -11,7 +11,7 @@ use graph::{
         serde_json, Logger, NodeId, StoreError,
     },
 };
-use graph_chain_ethereum::NodeCapabilities;
+use graph_chain_ethereum::{self as ethereum, NodeCapabilities};
 use graph_store_postgres::{DeploymentPlacer, Shard as ShardName, PRIMARY_SHARD};
 
 use http::{HeaderMap, Uri};
@@ -101,7 +101,7 @@ impl Config {
         if !self.stores.contains_key(PRIMARY_SHARD.as_str()) {
             return Err(anyhow!("missing a primary store"));
         }
-        if self.stores.len() > 1 && *CLEANUP_BLOCKS {
+        if self.stores.len() > 1 && ethereum::ENV_VARS.cleanup_blocks {
             // See 8b6ad0c64e244023ac20ced7897fe666
             return Err(anyhow!(
                 "GRAPH_ETHEREUM_CLEANUP_BLOCKS can not be used with a sharded store"
@@ -325,7 +325,7 @@ impl PoolSize {
                 .map(|rule| rule.size)
                 .ok_or_else(|| {
                     anyhow!(
-                        "no rule matches `{}` for the pool of shard {}",
+                        "no rule matches node id `{}` for the pool of shard {}",
                         node.as_str(),
                         name
                     )
@@ -529,10 +529,20 @@ pub enum ProviderDetails {
     Web3(Web3Provider),
 }
 
+const FIREHOSE_FILTER_FEATURE: &str = "filters";
+const FIREHOSE_PROVIDER_FEATURES: [&str; 1] = [FIREHOSE_FILTER_FEATURE];
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct FirehoseProvider {
     pub url: String,
     pub token: Option<String>,
+    #[serde(default)]
+    pub features: BTreeSet<String>,
+}
+
+impl FirehoseProvider {
+    pub fn filters_enabled(&self) -> bool {
+        self.features.contains(FIREHOSE_FILTER_FEATURE)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -585,6 +595,17 @@ impl Provider {
 
                 if let Some(token) = &firehose.token {
                     firehose.token = Some(shellexpand::env(token)?.into_owned());
+                }
+
+                if firehose
+                    .features
+                    .iter()
+                    .any(|feature| !FIREHOSE_PROVIDER_FEATURES.contains(&feature.as_str()))
+                {
+                    return Err(anyhow!(
+                        "supported firehose endpoint filters are: {:?}",
+                        FIREHOSE_PROVIDER_FEATURES
+                    ));
                 }
             }
 
@@ -1225,6 +1246,29 @@ mod tests {
         let actual = toml::from_str(
             r#"
                 label = "firehose"
+                details = { type = "firehose", url = "http://localhost:9000", features = [] }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            Provider {
+                label: "firehose".to_owned(),
+                details: ProviderDetails::Firehose(FirehoseProvider {
+                    url: "http://localhost:9000".to_owned(),
+                    token: None,
+                    features: BTreeSet::new(),
+                }),
+            },
+            actual
+        );
+    }
+
+    #[test]
+    fn it_works_on_new_firehose_provider_from_toml_no_features() {
+        let actual = toml::from_str(
+            r#"
+                label = "firehose"
                 details = { type = "firehose", url = "http://localhost:9000" }
             "#,
         )
@@ -1236,10 +1280,31 @@ mod tests {
                 details: ProviderDetails::Firehose(FirehoseProvider {
                     url: "http://localhost:9000".to_owned(),
                     token: None,
+                    features: BTreeSet::new(),
                 }),
             },
             actual
         );
+    }
+
+    #[test]
+    fn it_works_on_new_firehose_provider_from_toml_unsupported_features() {
+        let actual = toml::from_str::<Provider>(
+            r#"
+                label = "firehose"
+                details = { type = "firehose", url = "http://localhost:9000", features = ["bananas"]}
+            "#,
+        ).unwrap().validate();
+        assert_eq!(true, actual.is_err(), "{:?}", actual);
+
+        if let Err(error) = actual {
+            assert_eq!(
+                true,
+                error
+                    .to_string()
+                    .starts_with("supported firehose endpoint filters are:")
+            )
+        }
     }
 
     fn read_resource_as_string<P: AsRef<Path>>(path: P) -> String {

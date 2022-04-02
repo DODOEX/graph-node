@@ -298,6 +298,12 @@ impl From<GraphDeploymentId> for DeploymentId {
     }
 }
 
+impl From<DeploymentLocator> for DeploymentId {
+    fn from(loc: DeploymentLocator) -> Self {
+        Self::from(loc.id)
+    }
+}
+
 impl FromSql<Integer, Pg> for DeploymentId {
     fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
         let id = <i32 as FromSql<Integer, Pg>>::from_sql(bytes)?;
@@ -483,7 +489,7 @@ mod queries {
             .select(ds::all_columns)
             .load::<Schema>(conn)?
             .into_iter()
-            .map(|schema| Site::try_from(schema))
+            .map(Site::try_from)
             .collect::<Result<Vec<Site>, _>>()
     }
 
@@ -509,10 +515,7 @@ mod queries {
                 .filter(ds::active)
                 .first::<Schema>(conn)
         };
-        deployment
-            .optional()?
-            .map(|schema| Site::try_from(schema))
-            .transpose()
+        deployment.optional()?.map(Site::try_from).transpose()
     }
 
     /// Find sites by their subgraph deployment hashes. If `ids` is empty,
@@ -579,7 +582,7 @@ mod queries {
             .select(ds::all_columns)
             .load::<Schema>(conn)?
             .into_iter()
-            .map(|schema| Site::try_from(schema))
+            .map(Site::try_from)
             .collect::<Result<Vec<Site>, _>>()
     }
 
@@ -596,7 +599,7 @@ mod queries {
             .into_iter()
             .collect();
         for mut info in infos {
-            info.node = nodes.get(&info.subgraph).map(|s| s.clone());
+            info.node = nodes.get(&info.subgraph).cloned()
         }
         Ok(())
     }
@@ -841,7 +844,7 @@ impl<'a> Connection<'a> {
         exists_and_synced: F,
     ) -> Result<Vec<EntityChange>, StoreError>
     where
-        F: FnOnce(&DeploymentHash) -> Result<bool, StoreError>,
+        F: Fn(&DeploymentHash) -> Result<bool, StoreError>,
     {
         use subgraph as s;
         use subgraph_deployment_assignment as a;
@@ -882,7 +885,7 @@ impl<'a> Connection<'a> {
             .as_deref()
             .map(|id| {
                 DeploymentHash::new(id)
-                    .map_err(|e| StoreError::DeploymentNotFound(e))
+                    .map_err(StoreError::DeploymentNotFound)
                     .and_then(|id| exists_and_synced(&id))
             })
             .transpose()?
@@ -927,8 +930,11 @@ impl<'a> Connection<'a> {
 
         // See if we should make this the current or pending version
         let subgraph_row = update(s::table.filter(s::id.eq(&subgraph_id)));
-        match (mode, current_exists_and_synced) {
-            (Instant, _) | (Synced, false) => {
+        // When the new deployment is also synced already, we always want to
+        // overwrite the current version
+        let new_exists_and_synced = exists_and_synced(&site.deployment)?;
+        match (mode, current_exists_and_synced, new_exists_and_synced) {
+            (Instant, _, _) | (Synced, false, _) | (Synced, true, true) => {
                 subgraph_row
                     .set((
                         s::current_version.eq(&version_id),
@@ -936,7 +942,7 @@ impl<'a> Connection<'a> {
                     ))
                     .execute(conn)?;
             }
-            (Synced, true) => {
+            (Synced, true, false) => {
                 subgraph_row
                     .set(s::pending_version.eq(&version_id))
                     .execute(conn)?;
@@ -1159,9 +1165,9 @@ impl<'a> Connection<'a> {
         })
     }
 
-    pub fn find_site_by_name(&self, name: &str) -> Result<Option<Site>, StoreError> {
+    pub fn locate_site(&self, locator: DeploymentLocator) -> Result<Option<Site>, StoreError> {
         let schema = deployment_schemas::table
-            .filter(deployment_schemas::name.eq(name))
+            .filter(deployment_schemas::id.eq::<DeploymentId>(locator.into()))
             .first::<Schema>(self.conn.as_ref())
             .optional()?;
         schema.map(|schema| schema.try_into()).transpose()
@@ -1210,7 +1216,7 @@ impl<'a> Connection<'a> {
 
     /// Return the name of the node that has the fewest assignments out of the
     /// given `nodes`. If `nodes` is empty, return `None`
-    pub fn least_assigned_node(&self, nodes: &Vec<NodeId>) -> Result<Option<NodeId>, StoreError> {
+    pub fn least_assigned_node(&self, nodes: &[NodeId]) -> Result<Option<NodeId>, StoreError> {
         use subgraph_deployment_assignment as a;
 
         let nodes: Vec<_> = nodes.iter().map(|n| n.as_str()).collect();
@@ -1376,14 +1382,14 @@ impl<'a> Connection<'a> {
             .select(ds::all_columns)
             .load::<Schema>(self.conn.as_ref())?
             .into_iter()
-            .map(|schema| Site::try_from(schema))
+            .map(Site::try_from)
             .collect()
     }
 
     /// Add details from the deployment shard to unused deployments
     pub fn update_unused_deployments(
         &self,
-        details: &Vec<DeploymentDetail>,
+        details: &[DeploymentDetail],
     ) -> Result<(), StoreError> {
         use crate::detail::block;
         use unused_deployments as u;
@@ -1411,6 +1417,17 @@ impl<'a> Connection<'a> {
                 .execute(self.conn.as_ref())?;
         }
         Ok(())
+    }
+
+    /// The deployment `site` that we marked as unused previously is in fact
+    /// now used again, e.g., because it was redeployed in between recording
+    /// it as unused and now. Remove it from the `unused_deployments` table
+    pub fn unused_deployment_is_used(&self, site: &Site) -> Result<(), StoreError> {
+        use unused_deployments as u;
+        delete(u::table.filter(u::id.eq(site.id)))
+            .execute(self.conn.as_ref())
+            .map(|_| ())
+            .map_err(StoreError::from)
     }
 
     pub fn list_unused_deployments(
@@ -1654,7 +1671,7 @@ impl Mirror {
         &self,
         name: &SubgraphName,
     ) -> Result<DeploymentHash, StoreError> {
-        self.read(|conn| queries::current_deployment_for_subgraph(conn, &name))
+        self.read(|conn| queries::current_deployment_for_subgraph(conn, name))
     }
 
     pub fn deployments_for_subgraph(&self, name: &str) -> Result<Vec<Site>, StoreError> {

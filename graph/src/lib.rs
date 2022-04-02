@@ -27,11 +27,6 @@ pub mod firehose;
 /// Helpers for parsing environment variables.
 pub mod env;
 
-/// Module with mocks for different parts of the system.
-pub mod mock {
-    pub use crate::components::store::MockStore;
-}
-
 /// Wrapper for spawning tasks that abort on panic, which is our default.
 mod task_spawn;
 pub use task_spawn::{
@@ -40,7 +35,6 @@ pub use task_spawn::{
 
 pub use anyhow;
 pub use bytes;
-pub use mockall;
 pub use parking_lot;
 pub use petgraph;
 pub use prometheus;
@@ -64,6 +58,7 @@ pub mod prelude {
     pub use async_trait::async_trait;
     pub use bigdecimal;
     pub use chrono;
+    pub use envconfig;
     pub use ethabi;
     pub use futures::future;
     pub use futures::prelude::*;
@@ -119,12 +114,12 @@ pub mod prelude {
     pub use crate::components::server::query::GraphQLServer;
     pub use crate::components::server::subscription::SubscriptionServer;
     pub use crate::components::store::{
-        AttributeNames, BlockNumber, ChainStore, ChildMultiplicity, EntityCache, EntityChange,
-        EntityChangeOperation, EntityCollection, EntityFilter, EntityKey, EntityLink,
-        EntityModification, EntityOperation, EntityOrder, EntityQuery, EntityRange, EntityWindow,
-        EthereumCallCache, ParentLink, PoolWaitStats, QueryStore, QueryStoreManager, StoreError,
-        StoreEvent, StoreEventStream, StoreEventStreamBox, SubgraphStore, WindowAttribute,
-        BLOCK_NUMBER_MAX, SUBSCRIPTION_THROTTLE_INTERVAL,
+        AttributeNames, BlockNumber, CachedEthereumCall, ChainStore, ChildMultiplicity,
+        EntityCache, EntityChange, EntityChangeOperation, EntityCollection, EntityFilter,
+        EntityKey, EntityLink, EntityModification, EntityOperation, EntityOrder, EntityQuery,
+        EntityRange, EntityWindow, EthereumCallCache, ParentLink, PoolWaitStats, QueryStore,
+        QueryStoreManager, StoreError, StoreEvent, StoreEventStream, StoreEventStreamBox,
+        SubgraphStore, UnfailOutcome, WindowAttribute, BLOCK_NUMBER_MAX,
     };
     pub use crate::components::subgraph::{
         BlockState, DataSourceTemplateInfo, HostMetrics, RuntimeHost, RuntimeHostBuilder,
@@ -132,6 +127,7 @@ pub mod prelude {
         SubgraphVersionSwitchingMode,
     };
     pub use crate::components::{transaction_receipt, EventConsumer, EventProducer};
+    pub use crate::env::ENV_VARS;
 
     pub use crate::cheap_clone::CheapClone;
     pub use crate::data::graphql::{
@@ -190,7 +186,7 @@ pub mod prelude {
     static_graphql!(q, query, {
         Document, Value, OperationDefinition, InlineFragment, TypeCondition,
         FragmentSpread, Field, Selection, SelectionSet, FragmentDefinition,
-        Directive, VariableDefinition, Type,
+        Directive, VariableDefinition, Type, Query,
     });
     static_graphql!(s, schema, {
         Field, Directive, InterfaceType, ObjectType, Value, TypeDefinition,

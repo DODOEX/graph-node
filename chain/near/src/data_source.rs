@@ -43,7 +43,7 @@ impl blockchain::DataSource<Chain> for DataSource {
     fn match_and_decode(
         &self,
         trigger: &<Chain as Blockchain>::TriggerData,
-        block: Arc<<Chain as Blockchain>::Block>,
+        block: &Arc<<Chain as Blockchain>::Block>,
         _logger: &Logger,
     ) -> Result<Option<TriggerWithHandler<Chain>>, Error> {
         if self.source.start_block > block.number() {
@@ -231,7 +231,7 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
             context,
         } = self;
 
-        info!(logger, "Resolve data source"; "name" => &name, "source" => &source.start_block);
+        info!(logger, "Resolve data source"; "name" => &name, "source_account" => format_args!("{:?}", source.account), "source_start_block" => source.start_block);
 
         let mapping = mapping.resolve(&*resolver, logger).await?;
 

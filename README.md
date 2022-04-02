@@ -22,6 +22,10 @@ To build and run this project you need to have the following installed on your s
 
 For Ethereum network data, you can either run your own Ethereum node or use an Ethereum node provider of your choice.
 
+**Minimum Hardware Requirements:**
+
+- To build graph-node with `cargo`, 8GB RAM are required.
+
 ### Running a Local Graph Node
 
 This is a quick example to show a working Graph Node. It is a [subgraph for Gravatars](https://github.com/graphprotocol/example-subgraph).
@@ -117,11 +121,13 @@ OPTIONS:
         --ethereum-ws <NETWORK_NAME:[CAPABILITIES]:URL>
             Ethereum network name (e.g. 'mainnet'), optional comma-seperated capabilities (eg `full,archive), and an Ethereum WebSocket URL, separated by a ':'
 
+        --node-id <NODE_ID>
+            A unique identifier for this node instance. Should have the same value between consecutive node restarts [default: default]
+
         --http-port <PORT>                            Port for the GraphQL HTTP server [default: 8000]
         --ipfs <HOST:PORT>                            HTTP address of an IPFS node
-        --node-id <NODE_ID>                           a unique identifier for this node [default: default]
         --postgres-url <URL>                          Location of the Postgres database used for storing entities
-        --subgraph <[NAME:]IPFS_HASH>                 name and IPFS hash of the subgraph manifest
+        --subgraph <[NAME:]IPFS_HASH>                 Name and IPFS hash of the subgraph manifest
         --ws-port <PORT>                              Port for the GraphQL WebSocket server [default: 8001]
 ```
 

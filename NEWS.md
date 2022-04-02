@@ -1,5 +1,33 @@
 # NEWS
 
+## Unreleased
+- Gracefully handle syntax errors on fulltext search. Specifically provides information about common use case
+  where whitespace characters were part of the terms.
+- Adds support for Solidity Custom Errors (issue #2577)
+
+### Api Version 0.0.7 and Spec Version 0.0.5
+This release brings API Version 0.0.7 in mappings, which allows Ethereum event handlers to require transaction receipts to be present in the `Event` object.
+Refer to [PR #3373](https://github.com/graphprotocol/graph-node/pull/3373) for instructions on how to enable that.
+
+
+## 0.25.2
+
+This release includes two changes:
+
+- Bug fix of blocks being skipped from processing when: a deterministic error happens **and** the `index-node` gets restarted. Issue [#3236](https://github.com/graphprotocol/graph-node/issues/3236), Pull Request: [#3316](https://github.com/graphprotocol/graph-node/pull/3316).
+- Automatic retries for non-deterministic errors. Issue [#2945](https://github.com/graphprotocol/graph-node/issues/2945), Pull Request: [#2988](https://github.com/graphprotocol/graph-node/pull/2988).
+
+This is the last patch on the `0.25` minor version, soon `0.26.0` will be released. While that we recommend updating to this version to avoid determinism issues that could be caused on `graph-node` restarts.
+
+## 0.25.1
+
+This release only adds two fixes:
+
+- The first is to address an issue with decoding the input of some calls [#3194](https://github.com/graphprotocol/graph-node/issues/3194) where subgraphs that would try to index contracts related to those would fail. Now they can advance normally.
+- The second one is to fix a non-determinism issue with the retry mechanism for errors. Whenever a non-deterministic error happened, we would keep retrying to process the block, however we should've clear the `EntityCache` on each run so that the error entity changes don't get transacted/saved in the database in the next run. This could make the POI generation non-deterministic for subgraphs that failed and retried for non-deterministic reasons, adding a new entry to the database for the POI.
+
+We strongly recommend updating to this version as quickly as possible.
+
 ## 0.25.0
 
 ### Api Version 0.0.6
