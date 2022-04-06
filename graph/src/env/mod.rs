@@ -8,6 +8,7 @@ use semver::Version;
 use std::{
     collections::HashSet,
     env::VarError,
+    fmt,
     str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -74,7 +75,7 @@ pub fn env_var<E: std::error::Error + Send + Sync, T: FromStr<Err = E> + Eq>(
         .unwrap_or_else(|e| panic!("failed to parse environment variable {}: {}", name, e))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct EnvVars {
     pub graphql: EnvVarsGraphQl,
@@ -320,6 +321,13 @@ impl Default for EnvVars {
     }
 }
 
+// This does not print any values avoid accidentally leaking any sensitive env vars
+impl fmt::Debug for EnvVars {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "env vars")
+    }
+}
+
 #[derive(Clone, Debug, Envconfig)]
 struct Inner {
     #[envconfig(from = "GRAPH_LOAD_THRESHOLD", default = "0")]
@@ -333,7 +341,7 @@ struct Inner {
         default = "false"
     )]
     allow_non_deterministic_fulltext_search: EnvVarBoolean,
-    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "0.0.4")]
+    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "0.0.5")]
     max_spec_version: Version,
     #[envconfig(from = "GRAPH_DISABLE_GRAFTS", default = "false")]
     disable_grafts: EnvVarBoolean,

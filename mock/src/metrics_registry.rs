@@ -1,6 +1,6 @@
 use graph::components::metrics::{Collector, Counter, Gauge, Opts, PrometheusError};
 use graph::prelude::MetricsRegistry as MetricsRegistryTrait;
-use graph::prometheus::CounterVec;
+use graph::prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec};
 
 use std::collections::HashMap;
 
@@ -54,5 +54,27 @@ impl MetricsRegistryTrait for MockMetricsRegistry {
         let opts = Opts::new(name, help);
         let counters = CounterVec::new(opts, variable_labels)?;
         Ok(counters)
+    }
+
+    fn global_gauge_vec(
+        &self,
+        name: &str,
+        help: &str,
+        variable_labels: &[&str],
+    ) -> Result<GaugeVec, PrometheusError> {
+        let opts = Opts::new(name, help);
+        let gauges = GaugeVec::new(opts, variable_labels)?;
+        Ok(gauges)
+    }
+
+    fn global_histogram_vec(
+        &self,
+        name: &str,
+        help: &str,
+        variable_labels: &[&str],
+    ) -> Result<HistogramVec, PrometheusError> {
+        let opts = HistogramOpts::new(name, help);
+        let histograms = HistogramVec::new(opts, variable_labels)?;
+        Ok(histograms)
     }
 }

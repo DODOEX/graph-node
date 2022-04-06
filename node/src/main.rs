@@ -286,6 +286,7 @@ async fn main() {
             &near_networks,
             network_store.as_ref(),
             &logger_factory,
+            metrics_registry.clone(),
         );
 
         let tendermint_chains = tendermint_networks_as_chains(
@@ -294,6 +295,7 @@ async fn main() {
             &tendermint_networks,
             network_store.as_ref(),
             &logger_factory,
+            metrics_registry.clone(),
         );
 
         let blockchain_map = Arc::new(blockchain_map);
@@ -367,14 +369,14 @@ async fn main() {
             network_store.subgraph_store(),
             blockchain_map.cheap_clone(),
             metrics_registry.clone(),
-            link_resolver.cheap_clone(),
+            link_resolver.clone(),
             static_filters,
         );
 
         // Create IPFS-based subgraph provider
         let subgraph_provider = IpfsSubgraphAssignmentProvider::new(
             &logger_factory,
-            link_resolver.cheap_clone(),
+            link_resolver.clone(),
             subgraph_instance_manager,
         );
 
@@ -384,7 +386,7 @@ async fn main() {
         // Create named subgraph provider for resolving subgraph name->ID mappings
         let subgraph_registrar = Arc::new(IpfsSubgraphRegistrar::new(
             &logger_factory,
-            link_resolver.cheap_clone(),
+            link_resolver,
             Arc::new(subgraph_provider),
             network_store.subgraph_store(),
             subscription_manager,
@@ -592,6 +594,7 @@ fn tendermint_networks_as_chains(
     firehose_networks: &FirehoseNetworks,
     store: &Store,
     logger_factory: &LoggerFactory,
+    metrics_registry: Arc<MetricsRegistry>,
 ) -> HashMap<String, FirehoseChain<tendermint::Chain>> {
     let chains: Vec<_> = firehose_networks
         .networks
@@ -619,6 +622,7 @@ fn tendermint_networks_as_chains(
                         network_name.clone(),
                         chain_store,
                         firehose_endpoints.clone(),
+                        metrics_registry.clone(),
                     )),
                     firehose_endpoints: firehose_endpoints.clone(),
                 },
@@ -641,6 +645,7 @@ fn near_networks_as_chains(
     firehose_networks: &FirehoseNetworks,
     store: &Store,
     logger_factory: &LoggerFactory,
+    metrics_registry: Arc<MetricsRegistry>,
 ) -> HashMap<String, FirehoseChain<near::Chain>> {
     let chains: Vec<_> = firehose_networks
         .networks
@@ -667,6 +672,7 @@ fn near_networks_as_chains(
                         chain_id.clone(),
                         chain_store,
                         endpoints.clone(),
+                        metrics_registry.clone(),
                     )),
                     firehose_endpoints: endpoints.clone(),
                 },

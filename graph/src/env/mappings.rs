@@ -1,6 +1,8 @@
+use std::fmt;
+
 use super::*;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EnvVarsMapping {
     /// Size limit of the entity LFU cache.
     ///
@@ -67,6 +69,13 @@ pub struct EnvVarsMapping {
     pub allow_non_deterministic_ipfs: bool,
 }
 
+// This does not print any values avoid accidentally leaking any sensitive env vars
+impl fmt::Debug for EnvVarsMapping {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "env vars")
+    }
+}
+
 impl From<InnerMappingHandlers> for EnvVarsMapping {
     fn from(x: InnerMappingHandlers) -> Self {
         Self {
@@ -92,7 +101,7 @@ impl From<InnerMappingHandlers> for EnvVarsMapping {
 pub struct InnerMappingHandlers {
     #[envconfig(from = "GRAPH_ENTITY_CACHE_SIZE", default = "10000")]
     entity_cache_size_in_kb: usize,
-    #[envconfig(from = "GRAPH_MAX_API_VERSION", default = "0.0.6")]
+    #[envconfig(from = "GRAPH_MAX_API_VERSION", default = "0.0.7")]
     max_api_version: Version,
     #[envconfig(from = "GRAPH_MAPPING_HANDLER_TIMEOUT")]
     mapping_handler_timeout_in_secs: Option<u64>,
