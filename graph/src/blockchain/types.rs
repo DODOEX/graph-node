@@ -5,6 +5,9 @@ use std::convert::TryFrom;
 use std::{fmt, str::FromStr};
 use web3::types::{Block, H256};
 
+use crate::data::graphql::IntoValue;
+use crate::object;
+use crate::prelude::{r, BigInt, TryFromValue, ValueMap};
 use crate::{cheap_clone::CheapClone, components::store::BlockNumber};
 
 /// A simple marker for byte arrays that are really block hashes
@@ -22,6 +25,10 @@ impl BlockHash {
     /// should be changed to use `bytea`
     pub fn hash_hex(&self) -> String {
         hex::encode(&self.0)
+    }
+
+    pub fn zero() -> Self {
+        Self::from(H256::zero())
     }
 }
 
@@ -214,6 +221,33 @@ impl TryFrom<(&[u8], i64)> for BlockPtr {
             ));
         };
         Ok(BlockPtr::from((hash, number)))
+    }
+}
+
+impl TryFromValue for BlockPtr {
+    fn try_from_value(value: &r::Value) -> Result<Self, anyhow::Error> {
+        match value {
+            r::Value::Object(o) => {
+                let number = o.get_required::<BigInt>("number")?.to_u64() as BlockNumber;
+                let hash = o.get_required::<H256>("hash")?;
+
+                Ok(BlockPtr::from((hash, number)))
+            }
+            _ => Err(anyhow!(
+                "failed to parse non-object value into BlockPtr: {:?}",
+                value
+            )),
+        }
+    }
+}
+
+impl IntoValue for BlockPtr {
+    fn into_value(self) -> r::Value {
+        object! {
+            __typename: "Block",
+            hash: self.hash_hex(),
+            number: format!("{}", self.number),
+        }
     }
 }
 

@@ -162,7 +162,7 @@ pub trait WritableStore: Send + Sync + 'static {
     /// subgraph block pointer to `block_ptr_to`.
     ///
     /// `block_ptr_to` must point to the parent block of the subgraph block pointer.
-    fn revert_block_operations(
+    async fn revert_block_operations(
         &self,
         block_ptr_to: BlockPtr,
         firehose_cursor: Option<&str>,
@@ -195,7 +195,7 @@ pub trait WritableStore: Send + Sync + 'static {
     /// subgraph block pointer to `block_ptr_to`, and update the firehose cursor to `firehose_cursor`
     ///
     /// `block_ptr_to` must point to a child block of the current subgraph block pointer.
-    fn transact_block_operations(
+    async fn transact_block_operations(
         &self,
         block_ptr_to: BlockPtr,
         firehose_cursor: Option<String>,
@@ -233,6 +233,9 @@ pub trait WritableStore: Send + Sync + 'static {
     async fn health(&self, id: &DeploymentHash) -> Result<SubgraphHealth, StoreError>;
 
     fn input_schema(&self) -> Arc<Schema>;
+
+    /// Wait for the background writer to finish processing its queue
+    async fn flush(&self) -> Result<(), StoreError>;
 }
 
 #[async_trait]
@@ -451,4 +454,13 @@ pub trait StatusStore: Send + Sync + 'static {
         indexer: &Option<Address>,
         block: BlockPtr,
     ) -> Result<Option<[u8; 32]>, StoreError>;
+
+    /// Like `get_proof_of_indexing` but returns a Proof of Indexing signed by
+    /// address `0x00...0`, which allows it to be shared in public without
+    /// revealing the indexers _real_ Proof of Indexing.
+    async fn get_public_proof_of_indexing(
+        &self,
+        subgraph_id: &DeploymentHash,
+        block_number: BlockNumber,
+    ) -> Result<Option<(PartialBlockPtr, [u8; 32])>, StoreError>;
 }

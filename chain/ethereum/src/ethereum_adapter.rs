@@ -13,7 +13,7 @@ use graph::prelude::tokio::try_join;
 use graph::{
     blockchain::{block_stream::BlockWithTriggers, BlockPtr, IngestorError},
     prelude::{
-        anyhow::{self, anyhow, bail, ensure},
+        anyhow::{self, anyhow, bail, ensure, Context},
         async_trait, debug, error, ethabi,
         futures03::{self, compat::Future01CompatExt, FutureExt, StreamExt, TryStreamExt},
         hex, info, retry, serde_json as json, stream, tiny_keccak, trace, warn,
@@ -42,6 +42,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::adapter::ProviderStatus;
 use crate::chain::BlockFinality;
 use crate::{
     adapter::{
@@ -826,29 +827,56 @@ impl EthereumAdapterTrait for EthereumAdapter {
         let logger = self.logger.clone();
 
         let web3 = self.web3.clone();
+        let metrics = self.metrics.clone();
+        let provider = self.provider().to_string();
         let net_version_future = retry("net_version RPC call", &logger)
             .no_limit()
             .timeout_secs(20)
             .run(move || {
                 let web3 = web3.cheap_clone();
-                async move { web3.net().version().await.map_err(Into::into) }
+                let metrics = metrics.cheap_clone();
+                let provider = provider.clone();
+                async move {
+                    web3.net().version().await.map_err(|e| {
+                        metrics.set_status(ProviderStatus::VersionFail, &provider);
+                        e.into()
+                    })
+                }
+            })
+            .map_err(|e| {
+                self.metrics
+                    .set_status(ProviderStatus::VersionTimeout, self.provider());
+                e
             })
             .boxed();
 
         let web3 = self.web3.clone();
+        let metrics = self.metrics.clone();
+        let provider = self.provider().to_string();
         let gen_block_hash_future = retry("eth_getBlockByNumber(0, false) RPC call", &logger)
             .no_limit()
             .timeout_secs(30)
             .run(move || {
                 let web3 = web3.cheap_clone();
+                let metrics = metrics.cheap_clone();
+                let provider = provider.clone();
                 async move {
                     web3.eth()
                         .block(BlockId::Number(Web3BlockNumber::Number(0.into())))
-                        .await?
+                        .await
+                        .map_err(|e| {
+                            metrics.set_status(ProviderStatus::GenesisFail, &provider);
+                            e
+                        })?
                         .map(|gen_block| gen_block.hash.map(BlockHash::from))
                         .flatten()
                         .ok_or_else(|| anyhow!("Ethereum node could not find genesis block"))
                 }
+            })
+            .map_err(|e| {
+                self.metrics
+                    .set_status(ProviderStatus::GenesisTimeout, self.provider());
+                e
             });
 
         let (net_version, genesis_block_hash) =
@@ -864,6 +892,8 @@ impl EthereumAdapterTrait for EthereumAdapter {
             genesis_block_hash,
         };
 
+        self.metrics
+            .set_status(ProviderStatus::Working, self.provider());
         Ok(ident)
     }
 
@@ -1062,9 +1092,10 @@ impl EthereumAdapterTrait for EthereumAdapter {
                 )
             })
             .buffered(ENV_VARS.block_ingestor_max_concurrent_json_rpc_calls);
-            graph::tokio_stream::StreamExt::collect::<Result<Vec<TransactionReceipt>, IngestorError>>(
-                receipt_stream,
-            ).boxed()
+            graph::tokio_stream::StreamExt::collect::<
+                Result<Vec<Arc<TransactionReceipt>>, IngestorError>,
+            >(receipt_stream)
+            .boxed()
         };
 
         let block_future =
@@ -1361,24 +1392,28 @@ pub(crate) async fn blocks_with_triggers(
         trigger_futs.push(block_future)
     }
 
-    // join on triger futures
-    let triggers: Vec<EthereumTrigger> = trigger_futs.try_concat().await?;
-
-    // get hash for "to" block
-    let to_hash = match adapter
+    // Get hash for "to" block
+    let to_hash_fut = adapter
         .block_hash_by_block_number(&logger, to)
-        .compat()
-        .await?
-    {
-        Some(hash) => hash,
-        None => {
-            warn!(logger,
-            "Ethereum endpoint is behind";
-            "url" => eth.url_hostname()
-            );
-            bail!("Block {} not found in the chain", to)
-        }
-    };
+        .and_then(|hash| match hash {
+            Some(hash) => Ok(hash),
+            None => {
+                warn!(logger,
+                      "Ethereum endpoint is behind";
+                      "url" => eth.url_hostname()
+                );
+                bail!("Block {} not found in the chain", to)
+            }
+        })
+        .compat();
+
+    // Join on triggers and block hash resolution
+    let (triggers, to_hash) = futures03::join!(trigger_futs.try_concat(), to_hash_fut);
+
+    // Unpack and handle possible errors in the previously joined futures
+    let triggers =
+        triggers.with_context(|| format!("Failed to obtain triggers for block {}", to))?;
+    let to_hash = to_hash.with_context(|| format!("Failed to infer hash for block {}", to))?;
 
     let mut block_hashes: HashSet<H256> =
         triggers.iter().map(EthereumTrigger::block_hash).collect();
@@ -1503,7 +1538,9 @@ pub(crate) fn parse_log_triggers(
                 .logs
                 .iter()
                 .filter(move |log| log_filter.matches(log))
-                .map(move |log| EthereumTrigger::Log(Arc::new(log.clone()), Some(receipt.clone())))
+                .map(move |log| {
+                    EthereumTrigger::Log(Arc::new(log.clone()), Some(receipt.cheap_clone()))
+                })
         })
         .collect()
 }
@@ -1720,7 +1757,7 @@ async fn fetch_transaction_receipts_in_batch_with_retry(
     hashes: Vec<H256>,
     block_hash: H256,
     logger: Logger,
-) -> Result<Vec<TransactionReceipt>, IngestorError> {
+) -> Result<Vec<Arc<TransactionReceipt>>, IngestorError> {
     let retry_log_message = format!(
         "batch eth_getTransactionReceipt RPC call for block {:?}",
         block_hash
@@ -1745,7 +1782,7 @@ async fn fetch_transaction_receipts_in_batch(
     hashes: Vec<H256>,
     block_hash: H256,
     logger: Logger,
-) -> Result<Vec<TransactionReceipt>, IngestorError> {
+) -> Result<Vec<Arc<TransactionReceipt>>, IngestorError> {
     let batching_web3 = Web3::new(Batch::new(web3.transport().clone()));
     let eth = batching_web3.eth();
     let receipt_futures = hashes
@@ -1764,7 +1801,7 @@ async fn fetch_transaction_receipts_in_batch(
 
     let mut collected = vec![];
     for receipt in receipt_futures.into_iter() {
-        collected.push(receipt.await?)
+        collected.push(Arc::new(receipt.await?))
     }
     Ok(collected)
 }
@@ -1775,7 +1812,7 @@ async fn fetch_transaction_receipt_with_retry(
     transaction_hash: H256,
     block_hash: H256,
     logger: Logger,
-) -> Result<TransactionReceipt, IngestorError> {
+) -> Result<Arc<TransactionReceipt>, IngestorError> {
     let logger = logger.cheap_clone();
     let retry_log_message = format!(
         "eth_getTransactionReceipt RPC call for transaction {:?}",
@@ -1790,6 +1827,7 @@ async fn fetch_transaction_receipt_with_retry(
         .and_then(move |some_receipt| {
             resolve_transaction_receipt(some_receipt, transaction_hash, block_hash, logger)
         })
+        .map(Arc::new)
 }
 
 fn resolve_transaction_receipt(
@@ -1911,10 +1949,10 @@ async fn get_transaction_receipts_for_transaction_hashes(
     adapter: &EthereumAdapter,
     transaction_hashes_by_block: &HashMap<H256, HashSet<H256>>,
     logger: Logger,
-) -> Result<HashMap<H256, TransactionReceipt>, anyhow::Error> {
+) -> Result<HashMap<H256, Arc<TransactionReceipt>>, anyhow::Error> {
     use std::collections::hash_map::Entry::Vacant;
 
-    let mut receipts_by_hash: HashMap<H256, TransactionReceipt> = HashMap::new();
+    let mut receipts_by_hash: HashMap<H256, Arc<TransactionReceipt>> = HashMap::new();
 
     // Return early if input set is empty
     if transaction_hashes_by_block.is_empty() {

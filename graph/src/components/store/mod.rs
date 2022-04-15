@@ -160,6 +160,7 @@ pub enum EntityFilter {
     EndsWithNoCase(Attribute, Value),
     NotEndsWith(Attribute, Value),
     NotEndsWithNoCase(Attribute, Value),
+    ChangeBlockGte(BlockNumber),
 }
 
 // Define some convenience methods
@@ -752,6 +753,7 @@ pub enum UnfailOutcome {
     Unfailed,
 }
 
+#[derive(Clone)]
 pub struct StoredDynamicDataSource {
     pub name: String,
     pub source: Source,
@@ -835,6 +837,14 @@ impl EntityModification {
         use EntityModification::*;
         match self {
             Insert { key, .. } | Overwrite { key, .. } | Remove { key } => key,
+        }
+    }
+
+    pub fn entity(&self) -> Option<&Entity> {
+        match self {
+            EntityModification::Insert { data, .. }
+            | EntityModification::Overwrite { data, .. } => Some(data),
+            EntityModification::Remove { .. } => None,
         }
     }
 
@@ -940,5 +950,17 @@ impl AttributeNames {
             }
             (Select(a), Select(b)) => a.extend(b),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PartialBlockPtr {
+    pub number: BlockNumber,
+    pub hash: Option<BlockHash>,
+}
+
+impl From<BlockNumber> for PartialBlockPtr {
+    fn from(number: BlockNumber) -> Self {
+        Self { number, hash: None }
     }
 }

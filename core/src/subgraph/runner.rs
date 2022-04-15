@@ -187,9 +187,9 @@ where
             }
         };
 
-        // If new data sources have been created, restart the subgraph after this block.
-        // This is necessary to re-create the block stream.
-        let needs_restart = block_state.has_created_data_sources();
+        // If new data sources have been created, and static filters are not in use, it is necessary
+        // to restart the block stream with the new filters.
+        let needs_restart = block_state.has_created_data_sources() && !self.inputs.static_filters;
 
         // This loop will:
         // 1. Instantiate created data sources.
@@ -352,6 +352,7 @@ where
                 data_sources,
                 deterministic_errors,
             )
+            .await
             .context("Failed to transact block operations")?;
 
         // For subgraphs with `nonFatalErrors` feature disabled, we consider
@@ -642,7 +643,7 @@ where
                     }
                 }
 
-                if matches!(action, Action::Restart) && !self.inputs.static_filters {
+                if matches!(action, Action::Restart) {
                     // Cancel the stream for real
                     self.ctx
                         .instances
@@ -778,6 +779,7 @@ where
             .inputs
             .store
             .revert_block_operations(revert_to_ptr, cursor.as_deref())
+            .await
         {
             error!(&self.logger, "Could not revert block. Retrying"; "error" => %e);
 
