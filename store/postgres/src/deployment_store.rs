@@ -1119,7 +1119,7 @@ impl DeploymentStore {
         if block_ptr_to.number >= deployment_head.number {
             panic!("revert_block_operations must revert only backward, you are trying to revert forward going from subgraph block {} to new block {}", deployment_head, block_ptr_to);
         }
-
+        panic!("revert_block_operations find bug with lost data {} {} {}", site, deployment_head, block_ptr_to);
         self.rewind_with_conn(&conn, site, block_ptr_to, firehose_cursor)
     }
 
