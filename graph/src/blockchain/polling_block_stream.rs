@@ -27,6 +27,9 @@ lazy_static! {
         .unwrap_or("10".into())
         .parse::<BlockNumber>()
         .expect("invalid range min size");
+
+    static ref IS_SCAN_BY_ANCESTOR_BLOCK: bool = std::env::var("GRAPH_IS_SCAN_BY_ANCESTOR_BLOCK")
+        .is_ok();
 }
 
 enum BlockStreamState<C>
@@ -384,7 +387,7 @@ where
             info!(
                 ctx.logger,
                 "Scanning blocks [{}, {}]", from, to;
-                "range_size" => range_size
+                "range_size" => (to - from + 1)
             );
 
             let blocks = self.adapter.scan_triggers(from, to, &self.filter).await?;
@@ -392,7 +395,7 @@ where
             Ok(ReconciliationStep::ProcessDescendantBlocks(
                 blocks, range_size,
             ))
-        } else {
+        } else if *IS_SCAN_BY_ANCESTOR_BLOCK {
             // The subgraph ptr is not too far behind the head ptr.
             // This means a few things.
             //
@@ -465,6 +468,8 @@ where
                     }
                 }
             }
+        } else {
+            Ok(ReconciliationStep::Retry)
         }
     }
 
