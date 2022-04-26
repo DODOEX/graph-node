@@ -1192,7 +1192,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
             Err(e) => return Box::new(future::err(EthereumContractCallError::EncodingError(e))),
         };
 
-        trace!(logger, "eth_call";
+        info!(logger, "eth_call";
             "address" => hex::encode(&call.address),
             "data" => hex::encode(&call_data)
         );
@@ -1222,14 +1222,16 @@ impl EthereumAdapterTrait for EthereumAdapter {
                         .map(move |result| {
                             // Don't block handler execution on writing to the cache.
                             let for_cache = result.0.clone();
-                            let _ = graph::spawn_blocking_allow_panic(move || {
-                                cache
-                                    .set_call(call.address, &call_data, call.block_ptr, &for_cache)
-                                    .map_err(|e| {
-                                        error!(logger, "call cache set error";
-                                                   "error" => e.to_string())
-                                    })
-                            });
+                            if !for_cache.is_empty() {
+                                let _ = graph::spawn_blocking_allow_panic(move || {
+                                    cache
+                                        .set_call(call.address, &call_data, call.block_ptr, &for_cache)
+                                        .map_err(|e| {
+                                            error!(logger, "call cache set error";
+                                                       "error" => e.to_string())
+                                        })
+                                });
+                            }
                             result.0
                         }),
                     )
