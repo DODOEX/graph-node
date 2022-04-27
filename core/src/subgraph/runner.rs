@@ -396,7 +396,6 @@ where
             return Err(BlockProcessingError::Canceled);
         }
 
-        info!(&logger, "7-- {}", needs_restart);
         match needs_restart {
             true => Ok(Action::Restart),
             false => Ok(Action::Continue),
