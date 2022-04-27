@@ -331,13 +331,11 @@ where
         let start = Instant::now();
 
         let store = &self.inputs.store;
-        info!(&logger, "1--");
         // If a deterministic error has happened, make the PoI to be the only entity that'll be stored.
         if has_errors && !is_non_fatal_errors_active {
             let is_poi_entity =
                 |entity_mod: &EntityModification| entity_mod.entity_key().entity_type.is_poi();
             mods.retain(is_poi_entity);
-            info!(&logger, "2--");
             // Confidence check
             assert!(
                 mods.len() == 1,
@@ -371,10 +369,12 @@ where
         //
         // In this scenario the only entity that is stored/transacted is the PoI,
         // all of the others are discarded.
-        info!(&logger, "3--");
         if has_errors && !is_non_fatal_errors_active {
             // Only the first error is reported.
-            info!(&logger, "4--");
+            if ENV_VARS.disable_fail_fast {
+                return Err(BlockProcessingError::Unknown(anyhow::format_err!("{}",first_error.unwrap().message)));
+            }
+
             return Err(BlockProcessingError::Deterministic(first_error.unwrap()));
         }
 
@@ -384,11 +384,9 @@ where
             .block_ops_transaction_duration
             .observe(elapsed);
 
-        info!(&logger, "5--");
         // To prevent a buggy pending version from replacing a current version, if errors are
         // present the subgraph will be unassigned.
         if has_errors && !ENV_VARS.disable_fail_fast && !store.is_deployment_synced().await? {
-            info!(&logger, "6--");
             store
                 .unassign_subgraph()
                 .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
