@@ -28,6 +28,11 @@ lazy_static! {
         .parse::<BlockNumber>()
         .expect("invalid range min size");
 
+    static ref GREATER_THAN_RANGE_SIZE: BlockNumber = std::env::var("GRAPH_GREATER_THAN_RANGE_SIZE")
+        .unwrap_or("1".into())
+        .parse::<BlockNumber>()
+        .expect("invalid greater than range size");
+
     static ref IS_SCAN_BY_ANCESTOR_BLOCK: bool = std::env::var("GRAPH_IS_SCAN_BY_ANCESTOR_BLOCK")
         .is_ok();
 }
@@ -384,17 +389,23 @@ where
             };
             let to = cmp::min(from + range_size - 1, to_limit);
 
-            info!(
-                ctx.logger,
-                "Scanning blocks [{}, {}]", from, to;
-                "range_size" => (to - from + 1)
-            );
+            let rel_range_size = to - from + 1;
 
-            let blocks = self.adapter.scan_triggers(from, to, &self.filter).await?;
-
-            Ok(ReconciliationStep::ProcessDescendantBlocks(
-                blocks, range_size,
-            ))
+            if rel_range_size  > *GREATER_THAN_RANGE_SIZE {
+                info!(
+                    ctx.logger,
+                    "Scanning blocks [{}, {}]", from, to;
+                    "range_size" => rel_range_size
+                );
+    
+                let blocks = self.adapter.scan_triggers(from, to, &self.filter).await?;
+    
+                Ok(ReconciliationStep::ProcessDescendantBlocks(
+                    blocks, range_size,
+                ))
+            } else {
+                Ok(ReconciliationStep::Retry)
+            }
         } else if *IS_SCAN_BY_ANCESTOR_BLOCK {
             // The subgraph ptr is not too far behind the head ptr.
             // This means a few things.
