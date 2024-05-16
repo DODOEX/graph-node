@@ -453,7 +453,7 @@ impl EthereumAdapter {
                 async move {
                     let req = CallRequest {
                         to: Some(contract_address),
-                        gas: Some(web3::types::U256::from(ETH_CALL_GAS)),
+                        gas: Some(web3::types::U256::from(*ETH_CALL_GAS)),
                         data: Some(call_data.clone()),
                         from: None,
                         gas_price: None,
